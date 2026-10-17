@@ -237,6 +237,40 @@ test('native runner: without documented streaming input it falls back to one pro
   }
 })
 
+test('one-shot: a prompt longer than the command-line limit is delivered over stdin (stream-json) instead of failing', async () => {
+  const PONG = readFileSync(join(ROOT, 'scripts', 'fixtures', 'agy-1.4.0-pong.ndjson'), 'utf8')
+  const { dir, h, main } = setup('agy-stdin-oneshot-', { nativePersistentSessions: false }, { streamMock: false, plans: [{ chunks: [Buffer.from(PONG)] }] })
+  try {
+    const long = 'please review this text: ' + 'z'.repeat(40_000)
+    const result = await turn(h, main, long)
+    assert.equal(result.text, 'PONG\n')
+    const { spec, handle } = h.spawns[0]
+    assert.equal(spec.argv.includes('-p'), false)
+    assert.equal(flag(spec.argv, '--input-format'), 'stream-json')
+    assert.equal(flag(spec.argv, '--output-format'), 'stream-json')
+    assert.equal(spec.argv.includes('--print-timeout'), false)
+    assert.equal(spec.stdio.stdin, 'pipe')
+    const line = JSON.parse(handle.stdinText.trim())
+    assert.equal(line.event, 'user')
+    assert.match(line.message.content, /z{40000}/)
+    assert.equal(handle.stdinEnded, true, 'stdin is closed so agy finishes the turn and exits')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('one-shot over stdin against the protocol mock: one message, EOF, a single result', async () => {
+  const { dir, h, main } = setup('agy-stdin-mock-', { nativePersistentSessions: false })
+  try {
+    const result = await turn(h, main, 'long ' + 'q'.repeat(30_000))
+    assert.match(result.text, /^echo#1: \[user\]\nlong q/)
+    assert.equal(h.streamSpawns.length, 1)
+    await h.streamSpawns[0].handle.done
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('one-shot resume: DSH usage comes from this turn\'s calls, not from cumulative result.usage', async () => {
   const lines = [
     { event: 'init', conversation_id: 'conv-1', init: { cwd: 'C:/w', tools: [], permission_mode: 'always-proceed' } },

@@ -76,7 +76,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId, type ContentBlock, type GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { createHash, randomUUID } from 'node:crypto'
-import { NativeAgyLlmAdapter, NATIVE_MODEL_ID, nativePrompt, reconcileFinalText, type NativeTextSink } from './native-bridge.js'
+import { MAX_PROMPT_CHARS, NativeAgyLlmAdapter, NATIVE_MODEL_ID, nativePrompt, reconcileFinalText, type NativeTextSink } from './native-bridge.js'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
@@ -133,6 +133,8 @@ const MAX_RUN_RECORDS = 64
 const MAX_ARGV_PROMPT_CHARS = 30_000
 /** Bound for the one-time `agy help` flag probe. */
 const PROBE_TIMEOUT_MS = 10_000
+/** Prompt budget when the prompt travels over stdin (no command-line limit; AGY's context still applies). */
+const STDIN_PROMPT_MAX_CHARS = 400_000
 /** Bound for one `agy models` listing. */
 const MODELS_TIMEOUT_MS = 30_000
 /**
@@ -950,6 +952,23 @@ function attachStream(stdout: NodeJS.ReadableStream | undefined, onEvent: (event
   return { acc, drained }
 }
 
+/**
+ * Deliver a one-shot prompt over stdin (stream-json input): one user line,
+ * then EOF, after which agy finishes the turn and exits. A write failure
+ * surfaces as the run's own exit/diagnostic; it never hangs (stdin is closed).
+ */
+function writeStdinPrompt(handle: SubprocessHandle, prompt: string | undefined): void {
+  if (prompt === undefined) return
+  const stdin = handle.stdin
+  if (stdin === undefined) return
+  stdin.on('error', () => {})
+  try {
+    stdin.end(JSON.stringify({ event: 'user', message: { content: prompt } }) + '\n')
+  } catch {
+    // the process exit path reports the failure
+  }
+}
+
 /** Remove subdirectories of `root` untouched for longer than `maxAgeMs` (best effort). */
 function pruneOldDirectories(root: string, maxAgeMs: number): void {
   let names: string[]
@@ -1131,6 +1150,11 @@ interface SpawnPlan {
   sharedSkills: string[]
   /** Notes appended to every prompt (browser/large-read/supervision); persistent turns append them per stdin line. */
   promptSuffix: string
+  /**
+   * One-shot prompt delivered over stdin (one stream-json user line, then EOF)
+   * because it is too long for a command-line argument; requires stream-json output.
+   */
+  stdinPrompt?: string
 }
 
 /** What the native runner needs from one AGY turn, one-shot or persistent. */
@@ -1521,10 +1545,16 @@ class AntigravitySubagentProvider implements SubagentProvider {
     // automatically and the prompt is handed over via a temp file instead.
     let promptFilePath: string | undefined
     let promptArgv: string[]
+    let stdinPrompt: string | undefined
     if (persistent) {
       // Prompts go over stdin, one line per turn; -p would be ignored in this mode.
       if (!support.streamInput) throw new Error(`${PREFIX}: this agy build does not support --input-format stream-json`)
       promptArgv = ['--input-format', 'stream-json', '--output-format', 'stream-json']
+    } else if (effectivePrompt.length > MAX_ARGV_PROMPT_CHARS && !support.promptFile && support.streamInput) {
+      // Too long for argv: hand the prompt over stdin (documented streaming input,
+      // one message then EOF; the CLI finishes the turn and exits).
+      stdinPrompt = effectivePrompt
+      promptArgv = ['--input-format', 'stream-json']
     } else if (effectivePrompt.length > MAX_ARGV_PROMPT_CHARS) {
       if (!support.promptFile) {
         throw new Error(
@@ -1543,7 +1573,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
       promptArgv = ['-p', effectivePrompt]
     }
 
-    const baseArgv: string[] = persistent
+    const baseArgv: string[] = persistent || stdinPrompt !== undefined
       ? [exe, ...promptArgv]
       : [exe, ...promptArgv, '--print-timeout', `${Math.max(1, Math.round(timeoutMs / 1000))}s`]
     let effectiveModel = (options.model ?? config.model).trim()
@@ -1655,6 +1685,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
       selection,
       sharedSkills: shared?.names ?? [],
       promptSuffix: effectivePrompt.slice(promptText.length),
+      ...(stdinPrompt !== undefined ? { stdinPrompt } : {}),
     }
   }
 
@@ -1846,7 +1877,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
     try {
       const exe = await this.resolveCommandPath(env, new AbortController().signal)
       const support = await this.probeFlags(exe, env, parent.session.header.cwd ?? process.cwd())
-      if (!support.streamInput && !this.streamInputWarned) {
+      if (!support.streamInput && this.config.nativePersistentSessions && !this.streamInputWarned) {
         this.streamInputWarned = true
         this.ctx.logger.warn(`${PREFIX}: nativePersistentSessions is on but this agy build does not document --input-format stream-json; using one process per turn`)
       }
@@ -1995,7 +2026,8 @@ class AntigravitySubagentProvider implements SubagentProvider {
     const observe = options.stream ?? {}
     // stream-json whenever the build supports it and somebody consumes events
     // (durable trace and/or native live text); otherwise the historic json mode.
-    const streaming = plan.streamMode && (this.traces !== undefined || observe.onText !== undefined)
+    // A stdin-delivered prompt only exists in streaming mode.
+    const streaming = plan.stdinPrompt !== undefined || (plan.streamMode && (this.traces !== undefined || observe.onText !== undefined))
     const traceKey = observe.traceKey ?? (plan.id as unknown as string)
     const recorder = this.createRecorder(traceKey, plan.id as unknown as string, plan.childCwd, request.parent, observe)
 
@@ -2054,7 +2086,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
         argv,
         cwd: plan.childCwd,
         stdio: {
-          stdin: 'ignore',
+          stdin: plan.stdinPrompt !== undefined ? 'pipe' : 'ignore',
           stdout: live ? 'pipe' : { maxBytes: MAX_STDOUT_BYTES, spill: { maxBytes: MAX_STDOUT_SPILL_BYTES } },
           stderr: { maxBytes: MAX_STDERR_BYTES },
         },
@@ -2063,6 +2095,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
         env: plan.env,
       })
       current = live ? { handle, stream: attachStream(handle.stdout, onEvent) } : { handle }
+      writeStdinPrompt(handle, plan.stdinPrompt)
       return current
     }
 
@@ -2263,7 +2296,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
     const observe = options.stream ?? {}
     const traceKey = observe.traceKey ?? (id as unknown as string)
     const recorder = this.createRecorder(traceKey, id as unknown as string, plan.childCwd, request.parent, observe)
-    const format: TraceTransport = plan.streamMode ? 'stream-json' : plan.jsonMode ? 'json' : 'text'
+    const format: TraceTransport = plan.streamMode || plan.stdinPrompt !== undefined ? 'stream-json' : plan.jsonMode ? 'json' : 'text'
 
     let timedOut = false
     let visible = ''
@@ -2321,7 +2354,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
         argv,
         cwd: plan.childCwd,
         stdio: {
-          stdin: 'ignore',
+          stdin: plan.stdinPrompt !== undefined ? 'pipe' : 'ignore',
           stdout: 'pipe',
           stderr: { maxBytes: MAX_STDERR_BYTES },
         },
@@ -2333,6 +2366,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
       // UTF-8-safe line splitting: a multi-byte character split across stdout
       // chunks is decoded intact instead of turning into replacement chars.
       live = attachStream(handle.stdout, onEvent)
+      writeStdinPrompt(handle, plan.stdinPrompt)
     }
 
     const done = (async (): Promise<{ status: 'killed' | 'completed' | 'failed'; detail: string }> => {
@@ -2791,11 +2825,14 @@ export function apply(ctx: Context, config: Config): void {
 
       const previous = loadTaskRegistry(nativeIndexConfig, ctx.logger)[childId]
       const cwd = previous?.cwd ?? resolveChildCwd(PREFIX, configuredCwd, child.session.header.cwd)
-      const prompt = nativePrompt(options, previous !== undefined, { mode: isChild ? 'strict' : 'lenient', image })
+      // With documented streaming input a long prompt travels over stdin, so the
+      // command-line limit no longer bounds it.
+      const stdinCapable = await provider.supportsStreamInput(child)
+      const prompt = nativePrompt(options, previous !== undefined, { mode: isChild ? 'strict' : 'lenient', image, maxChars: stdinCapable ? STDIN_PROMPT_MAX_CHARS : MAX_PROMPT_CHARS })
       // Opt-in persistent process (stdin stream-json); one-shot remains the fallback.
       // A message starting with "/" would be taken as a CLI slash command, which ends a
       // streaming session (agy docs); such a turn runs one-shot instead.
-      const persistent = config.nativePersistentSessions && !prompt.trimStart().startsWith('/') && await provider.supportsStreamInput(child)
+      const persistent = config.nativePersistentSessions && !prompt.trimStart().startsWith('/') && stdinCapable
       let runDirs = dirs
       if (persistent && config.nativeImageInput) {
         // A stable image folder keeps the process key (and so the process) unchanged when images appear later.

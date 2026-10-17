@@ -35,16 +35,44 @@ test('lenient rendering (main session): no DSH system prompt, DSH tool traffic o
   assert.match(nativePrompt(req([{ role: 'user', content: [{ type: 'image', attachment: {} }] }]), false, { image: () => '[img]' }), /\[img\]/)
 })
 
+test('DSH harness context (skill catalog, runtime snapshot, approval/rewind notes) never reaches AGY; resume sends what the user said', () => {
+  const user = (t, extra = {}) => ({ role: 'user', content: text(t), source: { kind: 'user' }, ...extra })
+  const instructions = { role: 'user', content: text('<system-reminder>Use D:/conda_envs/gis_env python</system-reminder>'), source: { kind: 'agent-instructions', form: 'instructions' } }
+  const runtime = { role: 'user', content: text('Current runtime context. DSH file policy: danger-full-access.'), source: { kind: 'runtime-context', form: 'snapshot', sections: [] } }
+  const catalog = { role: 'user', content: text('<system-reminder>skills ' + 'x'.repeat(37_000) + '</system-reminder>'), source: { kind: 'skill-catalog', form: 'catalog', entries: [] } }
+  const approval = { role: 'user', content: text('The approval policy changed from "ask" to "never".'), source: { kind: 'user-approval' } }
+  const rewind = { role: 'user', content: text('(empty message)'), source: { kind: 'dsh-rewind' } }
+  // Exactly the shape of the failing first turn (37k catalog after the question).
+  const first = nativePrompt(req([approval, user('obelisk 可以作为 dsh 的记忆功能吗？'), instructions, runtime, catalog, rewind]), false, { mode: 'lenient' })
+  assert.match(first, /obelisk 可以作为 dsh 的记忆功能吗？/)
+  assert.match(first, /gis_env python/, 'workspace instructions are kept on the first turn')
+  assert.doesNotMatch(first, /skills xxx|DSH file policy|approval policy|empty message/)
+  assert.ok(first.length < 2000)
+  // A resumed turn: the bug sent the trailing runtime snapshot instead of the question.
+  const resumed = nativePrompt(req([user('hello'), { role: 'assistant', content: text('hi') }, user('你有什么 skill？'), instructions, runtime, catalog]), true, { mode: 'lenient' })
+  assert.equal(resumed, '你有什么 skill？')
+  // Children: a relayed message is the delivery.
+  const relay = { role: 'user', content: [{ type: 'text', text: 'Agent x sent a message: ' }, { type: 'text', text: 'PONG2 please' }], source: { kind: 'agent-message', form: 'relay' } }
+  assert.equal(nativePrompt(req([user('PONG'), { role: 'assistant', content: text('PONG') }, relay, runtime]), true), 'Agent x sent a message: \nPONG2 please')
+  assert.throws(() => nativePrompt(req([user('a'), { role: 'assistant', content: text('b') }, runtime, catalog]), true), /no user delivery/)
+})
+
+test('prompt budget: larger when the prompt travels over stdin', () => {
+  const long = 'y'.repeat(30_000)
+  assert.throws(() => nativePrompt(req([{ role: 'user', content: text(long), source: { kind: 'user' } }]), false, { mode: 'lenient' }), /latest message alone exceeds the prompt budget/)
+  assert.match(nativePrompt(req([{ role: 'user', content: text(long), source: { kind: 'user' } }]), false, { mode: 'lenient', maxChars: 400_000 }), /y{30000}/)
+})
+
 test('lenient rendering trims the oldest history to the CLI limit; the latest message alone must fit', () => {
   const big = 'x'.repeat(9_000)
   const history = [1, 2, 3, 4].flatMap((n) => [{ role: 'user', content: text(big + n) }, { role: 'assistant', content: text('ok ' + n) }])
   history.push({ role: 'user', content: text('latest question') })
-  assert.throws(() => nativePrompt(req(history), false), /first-turn prompt exceeds/)
+  assert.throws(() => nativePrompt(req(history), false), /first-turn prompt exceeds the prompt budget/)
   const trimmed = nativePrompt(req(history), false, { mode: 'lenient' })
   assert.ok(trimmed.length <= MAX_PROMPT_CHARS)
   assert.match(trimmed, /earlier message\(s\) omitted to fit/)
   assert.match(trimmed, /latest question/)
-  assert.throws(() => nativePrompt(req([{ role: 'user', content: text('y'.repeat(MAX_PROMPT_CHARS + 1)) }]), false, { mode: 'lenient' }), /latest message alone exceeds/)
+  assert.throws(() => nativePrompt(req([{ role: 'user', content: text('y'.repeat(MAX_PROMPT_CHARS + 1)) }]), false, { mode: 'lenient' }), /latest message alone exceeds the prompt budget/)
 })
 
 test('adapter declares image input only when the runner can hand images over', async () => {

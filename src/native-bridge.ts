@@ -62,10 +62,35 @@ export interface NativePromptOptions {
   includeSystem?: boolean
   /** Text that stands in for an image block (normally the saved file path); without it an image is rejected (strict) or noted (lenient). */
   image?: (block: { type: 'image'; attachment?: unknown }) => string | undefined
+  /** Prompt budget (default MAX_PROMPT_CHARS, the argv limit); larger when the prompt travels over stdin. */
+  maxChars?: number
 }
 
 interface RenderState {
   omittedTools: number
+}
+
+/**
+ * DSH harness context injected as user-role messages that describes DSH
+ * itself, not the task: catalogs (the DSH skill list, tens of KB), state
+ * snapshots (DSH sandbox/approval/runtime context) and approval/rewind
+ * bookkeeping. AGY cannot use any of it, and treating the last of these as
+ * "the user's message" sent AGY the runtime-context snapshot instead of the
+ * question. Workspace instructions are kept (first turn only).
+ */
+function sourceOf(message: unknown): { kind?: string; form?: string } {
+  const source = (message as { source?: { kind?: unknown; form?: unknown } }).source
+  return {
+    ...(typeof source?.kind === 'string' ? { kind: source.kind } : {}),
+    ...(typeof source?.form === 'string' ? { form: source.form } : {}),
+  }
+}
+
+const HARNESS_ONLY_KINDS = new Set(['user-approval', 'dsh-rewind', 'skill-catalog', 'runtime-context'])
+
+export function isHarnessContext(message: unknown): boolean {
+  const { kind, form } = sourceOf(message)
+  return form === 'catalog' || form === 'snapshot' || (kind !== undefined && HARNESS_ONLY_KINDS.has(kind))
 }
 
 function renderBlocks(content: unknown, options: NativePromptOptions, state: RenderState): string {
@@ -112,12 +137,13 @@ function renderBlocks(content: unknown, options: NativePromptOptions, state: Ren
 export function nativePrompt(options: GenerateOptions, resume: boolean, render: NativePromptOptions = {}): string {
   const lenient = render.mode === 'lenient'
   const includeSystem = render.includeSystem ?? !lenient
+  const maxChars = render.maxChars ?? MAX_PROMPT_CHARS
   const state: RenderState = { omittedTools: 0 }
   // A child's scoped tools can survive ctx.tools.restrict({ allow: [] });
   // schema advertisement is not permission or evidence that AGY can call them.
   // options.tools is never included in the CLI prompt. In strict mode DSH tool
   // messages fail closed rather than silently disappearing from history.
-  const items: { role: string; body: string }[] = []
+  const items: { role: string; body: string; instructions: boolean }[] = []
   for (const message of options.messages) {
     if (message.role !== 'user' && message.role !== 'assistant' && message.role !== 'system') {
       if (!lenient) throw new Error(`AGY native bridge: unsupported DSH message role ${String(message.role)} (text-only transport)`)
@@ -125,16 +151,21 @@ export function nativePrompt(options: GenerateOptions, resume: boolean, render: 
       continue
     }
     if (message.role === 'system' && !includeSystem) continue
+    if (message.role === 'user' && isHarnessContext(message)) continue
     const body = renderBlocks(message.content, render, state)
     // A main chat's own execution panels (GenUI fences) are display-only.
     const visible = lenient && message.role === 'assistant' ? body.replace(/```dsh-ui[\s\S]*?```/g, '[AGY execution panel omitted]') : body
-    if (visible.trim().length > 0) items.push({ role: message.role, body: visible })
+    if (visible.trim().length > 0) items.push({ role: message.role, body: visible, instructions: sourceOf(message).form === 'instructions' })
   }
   if (resume) {
-    const lastUser = items.findLast((message) => message.role === 'user')
-    if (!lastUser) throw new Error('AGY native bridge: no user delivery available for conversation continuation')
-    if (lastUser.body.length > MAX_PROMPT_CHARS) throw new Error('AGY native bridge: continued prompt exceeds safe CLI argument limit')
-    return lastUser.body
+    // Everything the user (or a relaying agent) said since AGY last answered;
+    // workspace instructions are already part of the AGY conversation.
+    const lastAssistant = items.findLastIndex((message) => message.role === 'assistant')
+    const pending = items.slice(lastAssistant + 1).filter((message) => message.role === 'user' && !message.instructions)
+    if (pending.length === 0) throw new Error('AGY native bridge: no user delivery available for conversation continuation')
+    const body = pending.map((message) => message.body).join('\n\n')
+    if (body.length > maxChars) throw new Error('AGY native bridge: continued prompt exceeds the prompt budget (' + body.length + ' > ' + maxChars + ' chars)')
+    return body
   }
   const header = includeSystem && options.system ? [`[DSH system]\n${options.system}`] : []
   const boundary = '[AGY execution boundary]\nYou are running inside Antigravity CLI. You cannot invoke DSH host tools. Use only the tools that AGY CLI actually exposes. Report real outcomes; never fabricate DSH tool results.'
@@ -147,14 +178,14 @@ export function nativePrompt(options: GenerateOptions, resume: boolean, render: 
     boundary,
   ].join('\n\n')
   let full = assemble(items, 0)
-  if (full.length <= MAX_PROMPT_CHARS) return full
-  if (!lenient) throw new Error('AGY native bridge: first-turn prompt exceeds safe CLI argument limit')
+  if (full.length <= maxChars) return full
+  if (!lenient) throw new Error('AGY native bridge: first-turn prompt exceeds the prompt budget (' + full.length + ' > ' + maxChars + ' chars)')
   // Keep the newest history that fits; the latest user message is never dropped.
   for (let dropped = 1; dropped < items.length; dropped += 1) {
     full = assemble(items.slice(dropped), dropped)
-    if (full.length <= MAX_PROMPT_CHARS) return full
+    if (full.length <= maxChars) return full
   }
-  throw new Error('AGY native bridge: the latest message alone exceeds the safe CLI argument limit')
+  throw new Error('AGY native bridge: the latest message alone exceeds the prompt budget (' + maxChars + ' chars)')
 }
 
 /** Receives AGY's real visible text fragments while the run is still executing. */

@@ -39,8 +39,14 @@ export function scriptedHandle(spec, plan) {
     stdout.end()
     setImmediate(() => resolveDone(outcome))
   }
+  // stdin 'pipe': capture what the plugin writes (stream-json prompt delivery).
+  const stdin = spec.stdio.stdin === 'pipe' ? new PassThrough() : undefined
+  let stdinText = ''
+  stdin?.on('data', (chunk) => { stdinText += chunk.toString('utf8') })
   const handle = {
-    stdin: undefined, stderr: undefined, control: undefined,
+    stdin, stderr: undefined, control: undefined,
+    get stdinText() { return stdinText },
+    get stdinEnded() { return stdin?.writableEnded === true },
     stdout: piped ? stdout : undefined,
     collected: {
       stderr: reader(() => plan.stderr ?? ''),

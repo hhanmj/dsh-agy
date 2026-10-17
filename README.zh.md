@@ -60,6 +60,7 @@ dsh plugin --profile web add "F:\agy-subagebt\deploy\dsh-subagent-agy-reviewed-h
 
 - AGY 在该会话的工作目录中使用**自己的工具**（同样带 `--dangerously-skip-permissions`，请只在可信目录中使用）；DSH 工具对它不可用，也不会被伪造。
 - 不发送 DSH 系统提示词；切换前的 DSH 工具调用/结果以「已省略」注明；首轮历史过长时只保留最近能放进 CLI 参数限制的消息并注明省略数量。之后每轮通过同一个 AGY `conversation_id` 续聊。
+- DSH 以用户消息形式注入的宿主上下文（技能目录、运行时/沙箱快照、审批与回退通知）不会发给 AGY；工作区指令只在首轮发送；续聊时发送自 AGY 上次回答以来用户（或转发代理）说的话。超过命令行长度限制的提示在 AGY 支持时改经 stdin 传递（stream-json 单条消息后关闭输入），不再报错。
 - **图片**（`nativeImageInput`，默认开启）：图片从 DSH 附件库复制到系统临时目录（`%TEMP%/dsh-agy-images/…`，7 天后清理），通过 `--add-dir` 交给 AGY，并在提示中写明路径；AGY 用自己的查看工具打开（实测能正确识别测试图片左红右蓝）。
 - DSH 的会话标题 / 压缩等辅助请求以一次性独立 AGY 调用完成，不进入该会话的 AGY 对话，也不采集证据。
 - 主对话的执行记录可由该会话自己用 `antigravity_trace`（id = 会话 id）查看；主对话中 AGY 每完成一个自身工具步骤，会以 `> AGY · run_command … — done (0.4s)` 形式插入一行进度（`nativeChatToolProgress`，子代理只写入 trace）。
