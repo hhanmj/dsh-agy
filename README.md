@@ -9,7 +9,7 @@ A DSH (DeepSeek Harness) plugin for delegating real coding tasks to the logged-i
 - Foreground `antigravity` delegation through `ctx.subagents.start()`.
 - Background AGY jobs, live output through DSH Jobs, cancel and independent working-tree evidence.
 - `antigravity_followup` uses AGY's own conversation ID.
-- **Experimental `antigravity_native_start`** uses real DSH `startContinuable()` to create a native DSH Agent and Session. A separate text-only model adapter delegates execution to AGY CLI and stores conversation ID mappings locally. Disabled unless `nativeContinuableEnabled: true`.
+- **Experimental `antigravity_native_start`** uses real DSH `startContinuable()` to create a native DSH Agent and Session. A separate text-only model adapter delegates execution to AGY CLI and stores conversation ID mappings locally. The source default is off, but the v0.4.1 bundle patch explicitly enables the preview. Existing installations can toggle it using `scripts/set-native-preview.ps1`; not a GUI toggle.
 
 ## Install
 
@@ -26,7 +26,13 @@ Use the profile **actually started** by your DSH host, not necessarily `web`. Re
 
 ## Experimental native child sessions
 
-Change the plugin configuration to `nativeContinuableEnabled: true`. Then invoke `antigravity_native_start({description, prompt})` from a DSH Agent. The tool returns a durable DSH child Session ID after the initial prompt was accepted; it **does not wait for AGY to finish**. Inspect the native subagent tree and use the DSH `send_message` tool for follow-ups to that direct child.
+The 0.4.1 bundle configuration includes `nativeContinuableEnabled: true`. If your already-installed bundle lacks that setting, enable it without reinstalling:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "F:\\agy-subagebt\\scripts\\set-native-preview.ps1" -Enable
+```
+
+Use `-Disable` to turn it off. The script backs up your profile patch and defaults to `web` (override with `-Profile`). Restart the DSH backend and inspect `dsh --profile web --dump-config` for `nativeContinuableEnabled: true`. **This is a command-line toggle, not a graphical marketplace setting.** Then invoke `antigravity_native_start({description, prompt})` from a DSH Agent. The tool returns a durable DSH child Session ID after the initial prompt was accepted; it **does not wait for AGY to finish**. Inspect the native subagent tree and use the DSH `send_message` tool for follow-ups to that direct child.
 
 This is **not** a fully capable DSH tools adapter: AGY CLI uses its own tools, while DSH-host tool declarations are intentionally blocked for the child. Native child-to-parent proactive messaging is not implemented. Text requests only. The first CLI call assembles the DSH text prompt, and subsequent calls use AGY `--conversation`. Native mappings are local state under `~/.dsh`, never repository content.
 

@@ -2,7 +2,7 @@
 
 基于 [ZEM17/dsh-subagent-agy](https://github.com/ZEM17/dsh-subagent-agy) 开发，MIT 许可。通过已登录的 Antigravity CLI 委派实际 UI/UX 和代码任务，主模型负责独立验收。
 
-**当前版本：v0.4.1。** 已实测通过的 v0.4.0 前台任务、后台 Jobs、Better Sidebar 后台显示和会话恢复保持不变；新增 DSH 原生 Continuable 子会话桥接为**默认关闭的实验功能**，尚未完成真实 DSH 界面的端到端验证。
+**当前版本：v0.4.1。** 已实测通过的 v0.4.0 前台任务、后台 Jobs、Better Sidebar 后台显示和会话恢复保持不变；新增 DSH 原生 Continuable 子会话桥接为**实验功能**，尚未完成真实 DSH 界面的端到端验证。v0.4.1 的发布包已显式开启预览模式；此前安装的同版本发布包可直接使用下述开关脚本，无需重新下载。
 
 ## 安装
 
@@ -29,11 +29,19 @@ dsh plugin --profile web add ".\dsh-external-dsh-subagent-agy-reviewed-0.4.1.tgz
 
 ### v0.4.1 原生子代理实验模式
 
-在插件配置中设置：
+**设置入口：** 本项目提供 PowerShell 开关脚本；这不是插件市场里的 GUI 开关。对当前已安装的 v0.4.1，直接运行（自动备份 Profile 配置，支持恢复）：
 
-```yaml
-nativeContinuableEnabled: true
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "F:\\agy-subagebt\\scripts\\set-native-preview.ps1" -Enable
 ```
+
+关闭功能时换成 `-Disable`。脚本默认修改当前 DSH Desktop 使用的 `web` Profile；其他 Profile 可传 `-Profile <名称>`。随后**重启 DSH 后端**（仅刷新界面不够）。验证配置：
+
+```powershell
+cmd /c "dsh.cmd --profile web --dump-config 2>NUL" | Select-String "nativeContinuableEnabled" -Context 2,0
+```
+
+必须看到 `nativeContinuableEnabled: true`，再在新对话中检查是否能调用 `antigravity_native_start`。如果工具没有注册，先检查插件加载日志，不要反复重装。
 
 然后让 DSH 主模型调用 `antigravity_native_start({description, prompt})`。工具仅在 DSH 子会话成功建立、首条消息进入 Inbox 后返回 `childId`，**并不代表 AGY 已经完成任务**。可在 Better Sidebar 原生子代理树观察子会话，通过 DSH 自带 `send_message` 向直接子代理发送后续指令。
 

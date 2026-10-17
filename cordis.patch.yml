@@ -1,4 +1,8 @@
-# Reviewed AGY subagent bundle entry. Install the locally built tgz.
+# Reviewed AGY subagent bundle entry. v0.4.1 enables the native preview for hands-on testing.
+# This flag is an explicit bundle setting; the source-code default remains false.
+# To disable for a profile, add config.nativeContinuableEnabled: false to its override.
 - insert:
     - id: dsh-subagent-agy-reviewed
       name: '@dsh-external/dsh-subagent-agy-reviewed'
+      config:
+        nativeContinuableEnabled: true
