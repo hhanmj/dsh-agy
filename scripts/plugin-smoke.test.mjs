@@ -111,3 +111,4 @@ test('DSH Jobs 0.2 background owner is SessionId and progress uses byte-offset o
     rmSync(dir, { recursive: true, force: true })
   }
 })
+

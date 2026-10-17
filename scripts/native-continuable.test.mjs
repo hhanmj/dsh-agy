@@ -45,7 +45,8 @@ test('native LLM adapter streams text without inventing tools or usage', async (
     seen.push(options)
     return 'AGY_NATIVE_OK'
   })
-  assert.equal((await adapter.listModels('agy-native-cli'))[0].id, 'agy-cli')
+  assert.deepEqual(await adapter.listModels('agy-native-cli'), [], 'only real agy models are listed; agy-cli is legacy-only')
+  assert.equal((await adapter.resolveModel('agy-native-cli', 'agy-cli')).id, 'agy-cli')
   assert.deepEqual((await adapter.resolveModel('agy-native-cli', 'agy-cli')).inputModalities, ['text'])
   const chunks = []
   for await (const chunk of adapter.stream(request([
@@ -88,7 +89,7 @@ test('native child start is real DSH startContinuable, no fabricated tree or loc
       get() { return undefined },
     }
     const registry = join(dir, 'agy-native-sessions.json')
-    apply(ctx, Config({ evidenceDir: join(dir, 'evidence'), nativeRegistryPath: registry, nativeContinuableEnabled: true }))
+    apply(ctx, Config({ evidenceDir: join(dir, 'evidence'), nativeRegistryPath: registry, nativeContinuableEnabled: true, traceDir: join(dir, 'traces') }))
     assert.ok(adapter)
     assert.ok(tools.has('antigravity_native_start'))
     const response = await tools.get('antigravity_native_start').execute(
@@ -98,7 +99,8 @@ test('native child start is real DSH startContinuable, no fabricated tree or loc
     assert.equal(response.state, 'accepted')
     assert.match(response.childId, /^[0-9a-f-]{36}$/i)
     assert.equal(startSpec.request.agentOptions.provider, 'agy-native-cli')
-    assert.equal(startSpec.request.agentOptions.model, 'agy-cli')
+    assert.equal(startSpec.request.agentOptions.model, 'gemini-3.8-flash')
+    assert.equal(startSpec.request.agentOptions.reasoningEffort, 'high')
     assert.deepEqual(startSpec.request.toolFilter, { allow: [] })
     assert.equal(startSpec.request.prompt[0].text, 'fix interactive UI')
 

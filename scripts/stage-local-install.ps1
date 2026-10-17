@@ -36,7 +36,10 @@ try {
   if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
     throw "Package archive not found: $archive"
   }
-  & tar -xf $archive -C $tmp
+  # Prefer Windows bsdtar: a GNU tar earlier on PATH (Git/MSYS) parses 'F:' as a remote host.
+  $tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
+  if (-not (Test-Path -LiteralPath $tarExe)) { $tarExe = 'tar' }
+  & $tarExe -xf $archive -C $tmp
   if ($LASTEXITCODE -ne 0) { throw 'Tar archive extraction failed' }
   $unpacked = Join-Path $tmp 'package'
   $package = Join-Path $unpacked 'package.json'

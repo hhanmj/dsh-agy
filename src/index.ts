@@ -74,13 +74,30 @@ import {
 import { scrubbedParentEnv, type SubprocessHandle } from '@deepseek-ai/dsh-subprocess'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import { randomUUID } from 'node:crypto'
-import { NativeAgyLlmAdapter, NATIVE_MODEL_ID, nativePrompt } from './native-bridge.js'
-import { dirname, isAbsolute, join } from 'node:path'
-import { tmpdir } from 'node:os'
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { captureWorkspace, classifyBackgroundTermination, collectEvidence, readEvidence, saveEvidence, type ExecutionStatus } from './evidence.js'
+import { ReasoningEffortId, type ContentBlock, type GenerateOptions } from '@deepseek-ai/dsh-llm'
+import { createHash, randomUUID } from 'node:crypto'
+import { NativeAgyLlmAdapter, NATIVE_MODEL_ID, nativePrompt, type NativeTextSink } from './native-bridge.js'
+import { basename, dirname, isAbsolute, join } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { captureWorkspace, classifyBackgroundTermination, collectEvidence, readEvidence, saveEvidence, type ExecutionStatus, type TaskEvidence } from './evidence.js'
+import { AgyStreamAccumulator, NdjsonLineSplitter, errorText, parseAgyErrorLine, parseAgyStreamLine, type AgyStreamEvent } from './stream-events.js'
+import {
+  DEFAULT_TRACE_LIMITS,
+  RunTraceRecorder,
+  TraceStore,
+  recordEvidence,
+  renderTraceRecord,
+  sanitizeText,
+  summarizeTrace,
+  type TraceKind,
+  type TraceRecord,
+  type TraceSummary,
+  type TraceTransport,
+} from './trace.js'
+import { prepareSupervisor, supervisionPromptNote, supervisorDirFor, type SupervisionReport, type SupervisorHandle } from './supervision.js'
+import { AgyModelCatalog, AgyModelSelectionError, EFFORT_ORDER, defaultEffortFor, resolveSelection, type AgyBaseModel } from './models.js'
+import { fileURLToPath } from 'node:url'
 
 export const name = '@dsh-external/dsh-subagent-agy-reviewed'
 export const inject = ['subagents', 'subprocess', 'tools', 'llm', 'agents']
@@ -114,6 +131,8 @@ const MAX_RUN_RECORDS = 64
 const MAX_ARGV_PROMPT_CHARS = 30_000
 /** Bound for the one-time `agy help` flag probe. */
 const PROBE_TIMEOUT_MS = 10_000
+/** Bound for one `agy models` listing. */
+const MODELS_TIMEOUT_MS = 30_000
 /**
  * Appended to every prompt when `avoidBrowser` is on: agy's headless
  * `browser_*` tools can hang indefinitely (browser launch / page load never
@@ -252,8 +271,80 @@ export const Config = z.object({
   nativeStartToolName: z.string().default('antigravity_native_start'),
   /** Dedicated native child id -> AGY conversation index; never bundled/published. */
   nativeRegistryPath: z.string().default(''),
+  /**
+   * Let a main DSH session that selects an AGY model in DSH's model list use
+   * the native transport too (AGY works with its own tools in that session's
+   * cwd; DSH tools are not available to it). Off: only child sessions.
+   */
+  nativeMainSessionEnabled: z.boolean().default(true),
+  /** Accept image input: images are copied to a temp directory and opened by AGY with its own file viewer. */
+  nativeImageInput: z.boolean().default(true),
+  /** Model for children/sessions that do not choose one (validated against "agy models"). Empty: the CLI's own default. */
+  nativeDefaultModel: z.string().default('gemini-3.8-flash'),
+  /** Effort for nativeDefaultModel when it has effort variants. */
+  nativeDefaultEffort: z.string().default('high'),
+  /** Ceiling for one native AGY turn (child or main chat): long coding turns run many AGY tool steps. */
+  nativeTimeoutMs: z.number().step(1).min(60_000).max(6 * 3_600_000).default(3_600_000),
+  /** Show AGY's own tool steps as short progress lines in a MAIN chat (children report them only in the trace). */
+  nativeChatToolProgress: z.boolean().default(true),
+  /**
+   * Context capacity advertised to DSH per base model id (tokens). agy reports
+   * none; defaults are vendor model-card figures (as compiled by the MIT
+   * project Jonah-Wu23/dsh-agy-safe) and AGY may compact earlier.
+   */
+  nativeContextWindows: z.dict(z.number()).default({
+    'gemini-3.8-flash': 1_048_576,
+    'claude-sonnet-4-6': 1_000_000,
+    'claude-opus-4-6-thinking': 1_000_000,
+    'gpt-oss-120b': 131_072,
+  }),
   /** Grace period for tree-scoped termination (SIGTERM→SIGKILL escalation). */
   disposeGraceMs: z.number().step(1).min(100).max(120_000).default(5_000),
+  /**
+   * Durable execution trace from agy `--output-format stream-json` events
+   * (AGY steps, AGY-internal tool calls, results, evidence links). When on,
+   * runs use stream-json whenever the installed build supports it.
+   */
+  traceEnabled: z.boolean().default(true),
+  /** Trace directory; empty uses ~/.dsh/agy-traces (never inside a repository). */
+  traceDir: z.string().default(''),
+  /** Model-facing trace query tool name. */
+  traceToolName: z.string().default('antigravity_trace'),
+  /** Per-trace record cap (step records past it are dropped; lifecycle records are kept). */
+  traceMaxEvents: z.number().step(1).min(100).max(100_000).default(DEFAULT_TRACE_LIMITS.maxEventsPerTrace),
+  /** Number of trace files kept (oldest are rotated out). */
+  traceMaxFiles: z.number().step(1).min(10).max(10_000).default(DEFAULT_TRACE_LIMITS.maxTraces),
+  /**
+   * Opt-in supervision through agy's own command hooks, injected per run with
+   * --add-dir (nothing is written into the workspace or global agy config).
+   * PreToolUse denies dangerous commands, credential/agent-state paths and
+   * writes outside the workspace; denials block even with skip-permissions.
+   * Requires skipPermissions; a run refuses to start if supervision cannot be applied.
+   */
+  supervisionEnabled: z.boolean().default(false),
+  /** Built-in command rules (git push, destructive git, publish, curl|sh, root deletes, system commands). */
+  supervisionBuiltinRules: z.boolean().default(true),
+  /** Extra case-insensitive regular expressions; matching run_command lines are denied. */
+  supervisionDenyCommands: z.array(z.string()).default([]),
+  /** Optional verification command run when AGY tries to stop; a non-zero exit asks AGY to rework. */
+  supervisionStopCheck: z.string().default(''),
+  supervisionStopCheckTimeoutMs: z.number().step(1).min(1000).max(600_000).default(120_000),
+  /** Upper bound for automatic rework rounds triggered by a failing stop check. */
+  supervisionMaxReworks: z.number().step(1).min(0).max(10).default(2),
+  /** Directory for per-run supervisor files; empty uses ~/.dsh/agy-supervisor. */
+  supervisionDir: z.string().default(''),
+  /** Model-facing read-only tool listing the models "agy models" reports. */
+  modelsToolName: z.string().default('antigravity_models'),
+  /**
+   * DSH skills AGY may use: exact names, prefix patterns ending in *, or * for
+   * every model-invocable DSH skill. Each run gets a bridge directory whose
+   * .agents/skills.json points AGY at the skills' own folders (--add-dir); nothing
+   * is copied into the repository or ~/.gemini. Skills that need DSH-only tools
+   * will not work inside AGY.
+   */
+  sharedSkills: z.array(z.string()).default([]),
+  /** Directory for skills.json bridge folders; empty uses ~/.dsh/agy-skill-bridge. */
+  sharedSkillsDir: z.string().default(''),
 })
 
 /** Runtime config after schemastery defaults. */
@@ -290,7 +381,29 @@ export interface Config {
   nativeLlmProvider: string
   nativeStartToolName: string
   nativeRegistryPath: string
+  nativeMainSessionEnabled: boolean
+  nativeImageInput: boolean
+  nativeDefaultModel: string
+  nativeDefaultEffort: string
+  nativeTimeoutMs: number
+  nativeChatToolProgress: boolean
+  nativeContextWindows: Record<string, number>
   disposeGraceMs: number
+  traceEnabled: boolean
+  traceDir: string
+  traceToolName: string
+  traceMaxEvents: number
+  traceMaxFiles: number
+  supervisionEnabled: boolean
+  supervisionBuiltinRules: boolean
+  supervisionDenyCommands: string[]
+  supervisionStopCheck: string
+  supervisionStopCheckTimeoutMs: number
+  supervisionMaxReworks: number
+  supervisionDir: string
+  modelsToolName: string
+  sharedSkills: string[]
+  sharedSkillsDir: string
 }
 
 /** One durable task entry: the agy conversation a follow-up resumes. */
@@ -299,6 +412,13 @@ export interface TaskRecord {
   cwd: string
   label: string
   createdAt: number
+  /**
+   * --model / --effort this conversation last ran with. agy falls back to its
+   * default model when a conversation is resumed without --model, so
+   * follow-ups re-send these unless the caller overrides them.
+   */
+  model?: string
+  effort?: string
 }
 
 /** Minimal logger shape for registry persistence (ctx.logger is assignable). */
@@ -422,6 +542,8 @@ export function loadTaskRegistry(config: Config, logger?: RegistryLogger): Recor
         cwd: entry.cwd,
         label: typeof entry.label === 'string' ? entry.label : '',
         createdAt: entry.createdAt,
+        ...(typeof entry.model === 'string' && entry.model.length > 0 ? { model: entry.model } : {}),
+        ...(typeof entry.effort === 'string' && entry.effort.length > 0 ? { effort: entry.effort } : {}),
       }
     } else {
       dropped += 1
@@ -653,6 +775,35 @@ export interface AgyNativeOptions {
   dirs?: string[]
   background?: boolean
   conversationId?: string
+  /** Trace to append to (follow-ups continue the original task's trace). */
+  traceKey?: string
+}
+
+/** How one run is observed: which trace it belongs to and who receives live text. */
+export interface AgyRunStreamOptions {
+  /** Trace key; defaults to the run id (task key). Native children use their child id. */
+  traceKey?: string
+  traceKind?: TraceKind
+  /** DSH Agent/Session id allowed to read the trace; defaults to the request parent. */
+  owner?: string | null
+  childId?: string
+  /** Free-form run mode label recorded in run_start. */
+  mode?: string
+  /** Receives AGY's real visible text deltas while the run executes. */
+  onText?: (delta: string) => void
+  /** Receives every decoded stream-json event (usage, tool steps) while the run executes. */
+  onEvent?: (event: AgyStreamEvent) => void
+}
+/** Per-run options shared by runOnce entry points. */
+export interface AgyRunOptions {
+  cwd?: string
+  model?: string
+  effort?: string
+  stream?: AgyRunStreamOptions
+  /** Extra --add-dir directories for this run (follow-ups; startWithDirs takes them positionally). */
+  dirs?: string[]
+  /** Run ceiling override (defaults to printTimeoutMs). */
+  timeoutMs?: number
 }
 export type AgyNativeRequest = SubagentStartRequest & { agyOptions: AgyNativeOptions }
 export type AgyManagedBackgroundRun = SubagentRun & {
@@ -725,6 +876,159 @@ export interface ActiveRunInfo {
   startedAt: number
   background: boolean
   cancel: () => void
+  /** Trace this run appends to, when tracing is on. */
+  traceKey?: string
+}
+
+/** Live stream-json decoding attached to one piped stdout. */
+interface LiveStream {
+  acc: AgyStreamAccumulator
+  /** Resolves once stdout ended and every complete line was consumed. */
+  drained: Promise<void>
+}
+
+/** Decode a piped stdout as stream-json; each parsed event goes to the accumulator, then `onEvent`. */
+function attachStream(stdout: NodeJS.ReadableStream | undefined, onEvent: (event: AgyStreamEvent) => void): LiveStream {
+  const splitter = new NdjsonLineSplitter()
+  const acc = new AgyStreamAccumulator()
+  const feed = (lines: string[]): void => {
+    for (const line of lines) {
+      const event = parseAgyStreamLine(line)
+      acc.apply(event)
+      try {
+        onEvent(event)
+      } catch {
+        // observers never break the transport
+      }
+    }
+  }
+  const drained = new Promise<void>((resolve) => {
+    if (stdout === undefined) {
+      resolve()
+      return
+    }
+    let finished = false
+    const finish = (): void => {
+      if (finished) return
+      finished = true
+      feed(splitter.end())
+      resolve()
+    }
+    stdout.on('data', (chunk: Buffer | string) => feed(splitter.push(chunk)))
+    stdout.once('end', finish)
+    stdout.once('close', finish)
+    stdout.once('error', finish)
+  })
+  return { acc, drained }
+}
+
+/** Remove subdirectories of `root` untouched for longer than `maxAgeMs` (best effort). */
+function pruneOldDirectories(root: string, maxAgeMs: number): void {
+  let names: string[]
+  try {
+    names = readdirSync(root)
+  } catch {
+    return
+  }
+  const now = Date.now()
+  for (const name of names) {
+    const dir = join(root, name)
+    try {
+      if (now - statSync(dir).mtimeMs > maxAgeMs) rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Wait for `promise`, but never longer than `ms`. */
+async function settleWithin(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined
+  await Promise.race([
+    promise.then(() => undefined, () => undefined),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms)
+    }),
+  ])
+  clearTimeout(timer)
+}
+
+function homeDirectory(): string {
+  return process.env.USERPROFILE ?? process.env.HOME ?? homedir()
+}
+
+function agentIdOf(agent: unknown): string | null {
+  const id = (agent as { id?: unknown } | null | undefined)?.id
+  return typeof id === 'string' && id.length > 0 ? id : null
+}
+
+/**
+ * DSH token usage for one AGY turn from AGY's own numbers. A DSH request is one
+ * AGY turn made of several model calls: the prompt side (uncached input +
+ * cache reads) is the LAST call's, which is the conversation's current
+ * context size (what DSH's context gauge shows); output and reasoning are the
+ * turn totals (what was generated). Nothing is estimated: with no reported
+ * usage, none is emitted.
+ */
+class TurnUsage {
+  private lastCall: { input_tokens?: number; cache_read_tokens?: number } | undefined
+  private total: { input_tokens?: number; output_tokens?: number; thinking_tokens?: number; cache_read_tokens?: number } | undefined
+
+  readonly observe = (event: AgyStreamEvent): void => {
+    if (event.kind === 'step' && event.stepType === 'agent_response' && event.usage !== undefined) this.lastCall = event.usage
+    if (event.kind === 'result' && event.usage !== undefined) this.total = event.usage
+  }
+
+  toDsh(): { usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; reasoningTokens?: number } } {
+    const prompt = this.lastCall ?? this.total
+    const output = this.total?.output_tokens
+    if (prompt?.input_tokens === undefined || output === undefined) return {}
+    return {
+      usage: {
+        inputTokens: prompt.input_tokens,
+        outputTokens: output,
+        ...(prompt.cache_read_tokens !== undefined ? { cacheReadTokens: prompt.cache_read_tokens } : {}),
+        ...(this.total?.thinking_tokens !== undefined ? { reasoningTokens: this.total.thinking_tokens } : {}),
+      },
+    }
+  }
+}
+
+/** One short, redacted line per finished AGY tool step for a main chat (not a DSH tool call). */
+function chatProgressLine(event: AgyStreamEvent): string | undefined {
+  if (event.kind !== 'step' || (event.stepType !== 'tool' && event.toolInfo === undefined)) return undefined
+  const state = event.state ?? ''
+  if (state !== 'DONE' && state !== 'ERROR') return undefined
+  const tool = event.toolName ?? event.toolInfo?.name ?? 'tool'
+  const params = event.toolInfo?.parameters as Record<string, unknown> | undefined
+  const subject = typeof params?.CommandLine === 'string' ? params.CommandLine
+    : typeof params?.TargetFile === 'string' ? params.TargetFile
+    : typeof params?.AbsolutePath === 'string' ? params.AbsolutePath : ''
+  const detail = subject ? ' ' + sanitizeText(subject, { home: homeDirectory() }, 120).replace(/\s+/g, ' ') : ''
+  const failed = state === 'ERROR' || (event.toolInfo?.error !== undefined && event.toolInfo.error !== null)
+  const seconds = event.durationSeconds !== undefined ? ' (' + event.durationSeconds.toFixed(1) + 's)' : ''
+  // Blank lines on both sides: a Markdown blockquote otherwise swallows the following text.
+  return '\n\n> AGY · ' + tool + detail + (failed ? ' — failed' : ' — done') + seconds + '\n\n'
+}
+
+/** Compact one-line progress marker for the background job_output stream. */
+function progressMarker(event: AgyStreamEvent): string {
+  if (event.kind !== 'step') return ''
+  const state = event.state ?? ''
+  if (state !== 'DONE' && state !== 'ERROR') return ''
+  if (event.stepType === 'tool' || event.toolInfo !== undefined) {
+    const tool = event.toolName ?? 'tool'
+    if (state === 'ERROR' || (event.toolInfo?.error !== undefined && event.toolInfo.error !== null)) {
+      const message = sanitizeText(errorText(event.toolInfo?.error) ?? 'error', {}, 160).replace(/\s+/g, ' ')
+      return `\n[agy: tool ${tool} error: ${message}]\n`
+    }
+    return `\n[agy: tool ${tool} done]\n`
+  }
+  const stepType = event.stepType ?? ''
+  if (state === 'DONE' && stepType.length > 0 && stepType !== 'agent_response' && stepType !== 'user_input' && stepType !== 'unknown') {
+    return `\n[agy: ${stepType} step done]\n`
+  }
+  return ''
 }
 
 /** Everything both the foreground and the background path need before spawning. */
@@ -742,6 +1046,32 @@ interface SpawnPlan {
   releasePromptFile: () => void
   id: SessionId
   label: string
+  /** Per-run agy hook supervision, when enabled. */
+  supervisor?: SupervisorHandle
+  /** The --model / --effort actually sent (requested values; the CLI decides what runs). */
+  selection: { model?: string; effort?: string; source: 'explicit' | 'plugin-default' | 'cli-default' }
+  /** DSH skills exposed to this run through the skills.json bridge. */
+  sharedSkills: string[]
+}
+
+/** Compiled supervisor hook text, read once from lib/. */
+let hookSourceCache: string | undefined
+function supervisorHookSource(): string {
+  hookSourceCache ??= readFileSync(fileURLToPath(new URL('./supervisor-hook.js', import.meta.url)), 'utf8')
+  return hookSourceCache
+}
+
+/** Collect and remove a run's supervisor files; never throws. */
+function finishSupervision(plan: SpawnPlan): SupervisionReport | undefined {
+  const supervisor = plan.supervisor
+  if (supervisor === undefined) return undefined
+  try {
+    return supervisor.collect()
+  } catch {
+    return undefined
+  } finally {
+    supervisor.dispose()
+  }
 }
 
 class AntigravitySubagentProvider implements SubagentProvider {
@@ -764,8 +1094,79 @@ class AntigravitySubagentProvider implements SubagentProvider {
     private readonly ctx: Context,
     private readonly config: Config,
     private readonly configuredCwd: string | undefined,
+    /** Durable execution traces; undefined when tracing is disabled. */
+    readonly traces?: TraceStore,
   ) {
     this.name = config.providerName
+  }
+
+  /** Real "agy models" catalog (TTL-cached; failures are reported, not cached). */
+  readonly models = new AgyModelCatalog(() => this.fetchAgyModelsOutput())
+
+  /** Run `agy models` (no agent turn, no quota) through the subprocess seam. */
+  private async fetchAgyModelsOutput(): Promise<string> {
+    const env = { ...scrubbedParentEnv(), ...this.config.env }
+    applyProxyEnv(env, resolveProxyUrl(this.config))
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), MODELS_TIMEOUT_MS)
+    try {
+      const exe = await this.resolveCommandPath(env, controller.signal)
+      const handle = this.ctx.subprocess.spawn({
+        argv: [exe, 'models'],
+        cwd: tmpdir(),
+        // stdin must not be an open pipe: agy waits for EOF on it.
+        stdio: { stdin: 'ignore', stdout: { maxBytes: 256 << 10 }, stderr: { maxBytes: 64 << 10 } },
+        graceMs: this.config.disposeGraceMs,
+        signal: controller.signal,
+        env,
+      })
+      const outcome = await handle.done
+      const stdout = handle.collected?.stdout?.readFrom(0).text ?? ''
+      const stderr = handle.collected?.stderr?.readFrom(0).text ?? ''
+      if (controller.signal.aborted) throw new Error(`"agy models" timed out after ${MODELS_TIMEOUT_MS} ms`)
+      if (outcome.exitCode !== 0) {
+        throw new Error(`"agy models" exited with code ${String(outcome.exitCode)}: ${stderr.trim().split(/\r?\n/).pop() ?? ''}`)
+      }
+      return stdout
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** Task keys of in-flight runs appending to `traceKey`. */
+  activeRunsFor(traceKey: string): Set<string> {
+    const out = new Set<string>()
+    for (const [task, info] of this.activeRuns) if (info.traceKey === traceKey) out.add(task)
+    return out
+  }
+
+  /** Link independently collected evidence to a trace run (no-op without tracing). */
+  recordEvidence(traceKey: string, runId: string, evidence: TaskEvidence): void {
+    if (this.traces === undefined) return
+    try {
+      recordEvidence(this.traces, traceKey, runId, evidence)
+    } catch (error) {
+      this.ctx.logger.warn(`${PREFIX}: failed to link evidence to trace: ${String(error)}`)
+    }
+  }
+
+  /** Create (or reuse) the trace and a recorder for one run. */
+  private createRecorder(
+    traceKey: string,
+    runId: string,
+    cwd: string,
+    parent: unknown,
+    observe: AgyRunStreamOptions,
+  ): RunTraceRecorder | undefined {
+    const traces = this.traces
+    if (traces === undefined) return undefined
+    traces.ensure({
+      trace_key: traceKey,
+      kind: observe.traceKind ?? 'task',
+      owner: observe.owner !== undefined ? observe.owner : agentIdOf(parent),
+      child_id: observe.childId ?? null,
+    })
+    return new RunTraceRecorder(traces, traceKey, runId, { cwd, home: homeDirectory() })
   }
 
   /** The bridge record for one finished run (for persistence), if captured. */
@@ -818,9 +1219,13 @@ class AntigravitySubagentProvider implements SubagentProvider {
     return `${Date.now().toString(36)}-${this.runSeq.toString(36)}`
   }
 
-  private remember(runId: string, conversationId: string | undefined, cwd: string, label: string): void {
+  private remember(runId: string, conversationId: string | undefined, cwd: string, label: string, selection: { model?: string; effort?: string } = {}): void {
     if (conversationId === undefined || conversationId.length === 0) return
-    this.runRecords.set(runId, { conversationId, cwd, label, createdAt: Date.now() })
+    this.runRecords.set(runId, {
+      conversationId, cwd, label, createdAt: Date.now(),
+      ...(selection.model ? { model: selection.model } : {}),
+      ...(selection.effort ? { effort: selection.effort } : {}),
+    })
     if (this.runRecords.size > MAX_RUN_RECORDS) {
       const oldest = [...this.runRecords.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]
       if (oldest !== undefined) this.runRecords.delete(oldest[0])
@@ -990,6 +1395,20 @@ class AntigravitySubagentProvider implements SubagentProvider {
     if (config.avoidLargeReads) effectivePrompt += AVOID_LARGE_READ_SUFFIX
 
     const support = await this.probeFlags(exe, env, childCwd)
+    const id = `${request.parent.session.id}::agy::${this.nextRunId()}` as unknown as SessionId
+    const supervisionBase = config.supervisionDir.length > 0 ? config.supervisionDir : join(pluginBaseDir() || join(homeDirectory(), '.dsh'), 'agy-supervisor')
+    let supervisorDir: string | undefined
+    if (config.supervisionEnabled) {
+      // Fail closed: an explicitly enabled guardrail is never silently skipped.
+      if (!config.skipPermissions) {
+        throw new Error(`${PREFIX}: supervisionEnabled is on but cannot be applied: it requires skipPermissions (hook "allow" would otherwise change headless approval behavior)`)
+      }
+      if (support.probed && !support.addDir) {
+        throw new Error(`${PREFIX}: supervisionEnabled is on but cannot be applied: this agy build lacks --add-dir, which carries the per-run hooks`)
+      }
+      supervisorDir = supervisorDirFor(supervisionBase, id as unknown as string)
+      effectivePrompt += supervisionPromptNote(childCwd, supervisorDir)
+    }
     if (conversationId !== undefined && !support.conversation) {
       throw new Error(
         `${PREFIX}: this agy build does not support --conversation — cannot resume task "${conversationId}". Upgrade agy or start a new task.`,
@@ -1039,14 +1458,50 @@ class AntigravitySubagentProvider implements SubagentProvider {
       '--print-timeout',
       `${Math.max(1, Math.round(timeoutMs / 1000))}s`,
     ]
-    const effectiveModel = options.model ?? config.model
-    const effectiveEffort = options.effort ?? config.effort
+    let effectiveModel = (options.model ?? config.model).trim()
+    let effectiveEffort = (options.effort ?? config.effort).trim().toLowerCase()
+    if (effectiveModel.length > 0) {
+      // Map base ids / variant ids onto what agy accepts (--model base --effort e,
+      // or a variant-less id without --effort). A listing failure leaves the raw
+      // values to agy, which rejects unknown models within seconds.
+      let models: AgyBaseModel[] | undefined
+      try {
+        models = await this.models.list()
+      } catch (error) {
+        ctx.logger.warn(`${PREFIX}: cannot validate AGY model ${effectiveModel} (${error instanceof Error ? error.message : String(error)}); passing it to agy unvalidated`)
+      }
+      if (models !== undefined) {
+        try {
+          const resolved = resolveSelection(models, effectiveModel, effectiveEffort || undefined)
+          effectiveModel = resolved.args.model ?? effectiveModel
+          effectiveEffort = resolved.args.effort ?? ''
+        } catch (error) {
+          if (error instanceof AgyModelSelectionError) throw new Error(`${PREFIX}: ${error.message}`)
+          throw error
+        }
+      }
+    }
+    const selection: SpawnPlan['selection'] = {
+      ...(effectiveModel.length > 0 ? { model: effectiveModel } : {}),
+      ...(effectiveEffort.length > 0 ? { effort: effectiveEffort } : {}),
+      source: options.model !== undefined || options.effort !== undefined ? 'explicit'
+        : config.model.length > 0 || config.effort.length > 0 ? 'plugin-default' : 'cli-default',
+    }
     if (effectiveModel.length > 0) baseArgv.push('--model', effectiveModel)
     if (effectiveEffort.length > 0) {
-      if (!['low', 'medium', 'high', 'xhigh', 'max'].includes(effectiveEffort)) {
+      if (!(EFFORT_ORDER as readonly string[]).includes(effectiveEffort)) {
         throw new Error(`${PREFIX}: effort must be one of low | medium | high | xhigh | max`)
       }
       baseArgv.push('--effort', effectiveEffort)
+    }
+    // DSH skills shared with AGY (declared via skills.json in a bridge directory).
+    const shared = await this.sharedSkillBridge(childCwd)
+    if (shared !== undefined) {
+      if (support.probed && !support.addDir) {
+        ctx.logger.warn(`${PREFIX}: this agy build lacks --add-dir; DSH skills are not shared`)
+      } else {
+        baseArgv.push('--add-dir', shared.dir)
+      }
     }
     if (config.agent.length > 0) baseArgv.push('--agent', config.agent)
     if (config.skipPermissions) baseArgv.push('--dangerously-skip-permissions')
@@ -1064,6 +1519,38 @@ class AntigravitySubagentProvider implements SubagentProvider {
       }
     }
 
+    let supervisor: SupervisorHandle | undefined
+    if (supervisorDir !== undefined) {
+      const refuse = (reason: string): never => {
+        releasePromptFile()
+        throw new Error(`${PREFIX}: supervisionEnabled is on but cannot be applied: ${reason}`)
+      }
+      try {
+        supervisor = prepareSupervisor({
+          baseDir: supervisionBase,
+          dir: supervisorDir,
+          runId: id as unknown as string,
+          roots: [childCwd, ...addDirs],
+          ...(shared !== undefined ? { readRoots: shared.roots } : {}),
+          cwd: childCwd,
+          home: homeDirectory(),
+          settings: {
+            denyCommands: config.supervisionDenyCommands,
+            builtinRules: config.supervisionBuiltinRules,
+            stopCheck: config.supervisionStopCheck,
+            stopCheckTimeoutMs: config.supervisionStopCheckTimeoutMs,
+            maxReworks: config.supervisionMaxReworks,
+          },
+          hookSource: supervisorHookSource(),
+          execPath: process.execPath,
+        })
+      } catch (error) {
+        refuse(error instanceof Error ? error.message : String(error))
+      }
+      baseArgv.push('--add-dir', supervisor!.dir)
+      Object.assign(env, supervisor!.env)
+    }
+
     return {
       childCwd,
       env,
@@ -1074,15 +1561,77 @@ class AntigravitySubagentProvider implements SubagentProvider {
       baseArgv,
       promptFilePath,
       releasePromptFile,
-      id: `${request.parent.session.id}::agy::${this.nextRunId()}` as unknown as SessionId,
+      id,
       label: request.label ?? 'antigravity task',
+      ...(supervisor !== undefined ? { supervisor } : {}),
+      selection,
+      sharedSkills: shared?.names ?? [],
     }
   }
 
+  /**
+   * Bridge directory exposing the configured DSH skills to agy: its
+   * .agents/skills.json declares each skill's parent folder with include_only
+   * (verified on agy 1.4.0 for --add-dir directories and absolute Windows
+   * paths). Content-addressed and reused; nothing is copied or linked.
+   */
+  private async sharedSkillBridge(cwd: string): Promise<{ dir: string; names: string[]; roots: string[] } | undefined> {
+    const patterns = this.config.sharedSkills.map((pattern) => pattern.trim()).filter((pattern) => pattern.length > 0)
+    if (patterns.length === 0) return undefined
+    const registry = (this.ctx as unknown as { get(name: string): unknown }).get('skills') as
+      | { list(options?: { cwd?: string }): Promise<{ name: string; path?: string; invocation?: { modelInvocable?: boolean } }[]> }
+      | undefined
+    if (registry === undefined || typeof registry.list !== 'function') {
+      this.ctx.logger.warn(`${PREFIX}: sharedSkills is set but the DSH skill registry is unavailable`)
+      return undefined
+    }
+    let skills: { name: string; path?: string; invocation?: { modelInvocable?: boolean } }[]
+    try {
+      skills = await registry.list({ cwd })
+    } catch (error) {
+      this.ctx.logger.warn(`${PREFIX}: cannot list DSH skills for AGY: ${String(error)}`)
+      return undefined
+    }
+    const wanted = (name: string): boolean => patterns.some((pattern) =>
+      pattern === '*' || (pattern.endsWith('*') ? name.startsWith(pattern.slice(0, -1)) : name === pattern))
+    const chosen = skills.filter((skill) => skill.invocation?.modelInvocable !== false && typeof skill.path === 'string' &&
+      isAbsolute(skill.path) && /[\\/]SKILL\.md$/i.test(skill.path) && wanted(skill.name))
+    if (chosen.length === 0) {
+      this.ctx.logger.warn(`${PREFIX}: sharedSkills matched no file-backed DSH skill (${patterns.join(', ')})`)
+      return undefined
+    }
+    const groups = new Map<string, Set<string>>()
+    for (const skill of chosen) {
+      const folder = dirname(skill.path as string)
+      const parent = dirname(folder).replace(/\\/g, '/')
+      const names = groups.get(parent) ?? new Set<string>()
+      names.add(basename(folder))
+      groups.set(parent, names)
+    }
+    const manifest = JSON.stringify({
+      entries: [...groups].sort(([a], [b]) => a.localeCompare(b)).map(([path, names]) => ({ path, include_only: [...names].sort() })),
+    }, null, 2)
+    const root = this.config.sharedSkillsDir.length > 0 ? this.config.sharedSkillsDir : join(pluginBaseDir() || join(homeDirectory(), '.dsh'), 'agy-skill-bridge')
+    pruneOldDirectories(root, 7 * 24 * 60 * 60 * 1000)
+    const dir = join(root, createHash('sha256').update(manifest).digest('hex').slice(0, 16))
+    const file = join(dir, '.agents', 'skills.json')
+    mkdirSync(dirname(file), { recursive: true })
+    if (!existsSync(file) || readFileSync(file, 'utf8') !== manifest) writeFileSync(file, manifest, 'utf8')
+    const now = new Date()
+    utimesSync(dir, now, now)
+    return { dir, names: chosen.map((skill) => skill.name).sort(), roots: chosen.map((skill) => dirname(skill.path as string)) }
+  }
+
   /** Opt-in DSH 0.2 native continuable creation. DSH owns the actual Agent and Session. */
-  async prepareContinuable(): Promise<{}> {
+  async prepareContinuable(request?: { sessionId?: unknown; parent?: unknown }): Promise<{}> {
     if (!this.config.nativeContinuableEnabled) {
       throw new Error(`${PREFIX}: native continuable disabled in plugin config`)
+    }
+    // The manager has reserved the durable child id and knows the delegating
+    // parent: record trace ownership before the child's first turn can run.
+    const childId = typeof request?.sessionId === 'string' ? request.sessionId : undefined
+    if (childId !== undefined && this.traces !== undefined) {
+      this.traces.ensure({ trace_key: childId, kind: 'native', owner: agentIdOf(request?.parent), child_id: childId })
     }
     return {}
   }
@@ -1116,16 +1665,17 @@ class AntigravitySubagentProvider implements SubagentProvider {
     const dirs = [...this.config.addDirs, ...(agy.dirs ?? [])]
     if (agy.conversationId !== undefined) {
       const conversationId = agy.conversationId
+      const stream: AgyRunStreamOptions = { mode: 'followup', ...(agy.traceKey !== undefined ? { traceKey: agy.traceKey } : {}) }
       return this.followupSerialized(conversationId,
-        () => this.runOnce(request, conversationId, agy.cwd, dirs, this.config.printTimeoutMs, agy))
+        () => this.runOnce(request, conversationId, agy.cwd, dirs, this.config.printTimeoutMs, { ...agy, stream }))
     }
-    return this.runOnce(request, undefined, undefined, dirs, this.config.printTimeoutMs, agy)
+    return this.runOnce(request, undefined, undefined, dirs, this.config.printTimeoutMs, { ...agy, stream: { mode: 'foreground' } })
   }
 
 
   /** Tool-layer entry: new task plus extra workspace dirs (config.addDirs ∪ tool dirs). */
-  startWithDirs(request: SubagentStartRequest, extraDirs: readonly string[], options: { cwd?: string; model?: string; effort?: string } = {}): Promise<SubagentRun> {
-    return this.runOnce(request as ResolvedSubagentStartRequest, undefined, undefined, [...this.config.addDirs, ...extraDirs], this.config.printTimeoutMs, options)
+  startWithDirs(request: SubagentStartRequest, extraDirs: readonly string[], options: AgyRunOptions = {}): Promise<SubagentRun> {
+    return this.runOnce(request as ResolvedSubagentStartRequest, undefined, undefined, [...this.config.addDirs, ...extraDirs], options.timeoutMs ?? this.config.printTimeoutMs, options)
   }
 
   /**
@@ -1133,8 +1683,8 @@ class AntigravitySubagentProvider implements SubagentProvider {
    * cwd. Same-conversation follow-ups are serialized per conversation id, so
    * concurrent prompts cannot corrupt one agy conversation file.
    */
-  followup(request: FollowupRequest, conversationId: string, cwd: string, options: { model?: string; effort?: string } = {}): Promise<SubagentRun> {
-    return this.followupSerialized(conversationId, () => this.runOnce(request as ResolvedSubagentStartRequest, conversationId, cwd, this.config.addDirs, this.config.printTimeoutMs, options))
+  followup(request: FollowupRequest, conversationId: string, cwd: string, options: Omit<AgyRunOptions, 'cwd'> = {}): Promise<SubagentRun> {
+    return this.followupSerialized(conversationId, () => this.runOnce(request as ResolvedSubagentStartRequest, conversationId, cwd, [...this.config.addDirs, ...(options.dirs ?? [])], options.timeoutMs ?? this.config.printTimeoutMs, options))
   }
 
   private followupSerialized(conversationId: string, task: () => Promise<SubagentRun>): Promise<SubagentRun> {
@@ -1172,10 +1722,16 @@ class AntigravitySubagentProvider implements SubagentProvider {
     cwdOverride: string | undefined,
     dirs: readonly string[],
     timeoutMs: number,
-    options: { cwd?: string; model?: string; effort?: string } = {},
+    options: AgyRunOptions = {},
   ): Promise<SubagentRun> {
     const { ctx, config } = this
     const plan = await this.spawnPlan(request, conversationId, cwdOverride, dirs, timeoutMs, options)
+    const observe = options.stream ?? {}
+    // stream-json whenever the build supports it and somebody consumes events
+    // (durable trace and/or native live text); otherwise the historic json mode.
+    const streaming = plan.streamMode && (this.traces !== undefined || observe.onText !== undefined)
+    const traceKey = observe.traceKey ?? (plan.id as unknown as string)
+    const recorder = this.createRecorder(traceKey, plan.id as unknown as string, plan.childCwd, request.parent, observe)
 
     // Local cancellation state: dispose() may settle teardown without the
     // request signal firing, so a killed agy must still land on 'aborted'.
@@ -1184,7 +1740,9 @@ class AntigravitySubagentProvider implements SubagentProvider {
     // (network stall, auth wait); a local timer terminates the tree.
     let timedOut = false
     let watchdog: NodeJS.Timeout | undefined
-    let current: { handle: SubprocessHandle } | undefined
+    let current: { handle: SubprocessHandle; stream?: LiveStream } | undefined
+    let lastOutcome: { exitCode: number | null; signal: string | null } | undefined
+    let lastStderr = ''
     const ensureTerminated = (): void => {
       current?.handle.terminate()
     }
@@ -1205,25 +1763,41 @@ class AntigravitySubagentProvider implements SubagentProvider {
     const disarmWatchdog = (): void => {
       clearTimeout(watchdog)
     }
+    const onEvent = (event: AgyStreamEvent): void => {
+      recorder?.onEvent(event)
+      try {
+        observe.onEvent?.(event)
+      } catch (error) {
+        ctx.logger.warn(`${PREFIX}: stream event consumer failed: ${String(error)}`)
+      }
+      if (event.kind === 'step' && event.textDelta !== undefined && event.textDelta.length > 0) {
+        try {
+          observe.onText?.(event.textDelta)
+        } catch (error) {
+          ctx.logger.warn(`${PREFIX}: live text consumer failed: ${String(error)}`)
+        }
+      }
+    }
 
-    const spawnOnce = (jsonModeArg: boolean) => {
+    const spawnOnce = (format: TraceTransport): { handle: SubprocessHandle; stream?: LiveStream } => {
       const argv = [...plan.baseArgv]
-      if (jsonModeArg) argv.push('--output-format', 'json')
+      if (format !== 'text') argv.push('--output-format', format)
       if (conversationId !== undefined) argv.push('--conversation', conversationId)
+      const live = format === 'stream-json'
       const handle = ctx.subprocess.spawn({
         argv,
         cwd: plan.childCwd,
         stdio: {
           stdin: 'ignore',
-          stdout: { maxBytes: MAX_STDOUT_BYTES, spill: { maxBytes: MAX_STDOUT_SPILL_BYTES } },
+          stdout: live ? 'pipe' : { maxBytes: MAX_STDOUT_BYTES, spill: { maxBytes: MAX_STDOUT_SPILL_BYTES } },
           stderr: { maxBytes: MAX_STDERR_BYTES },
         },
         graceMs: config.disposeGraceMs,
         signal: request.signal,
         env: plan.env,
       })
-      current = { handle }
-      return handle
+      current = live ? { handle, stream: attachStream(handle.stdout, onEvent) } : { handle }
+      return current
     }
 
     const readStdout = (handle: { collected?: import('@deepseek-ai/dsh-subprocess').SubprocessCollectedOutputs }): string =>
@@ -1232,10 +1806,10 @@ class AntigravitySubagentProvider implements SubagentProvider {
       handle.collected?.stderr?.readFrom(0).text ?? ''
 
     const snapshot = (): { type: 'text'; text: string }[] => {
-      const handle = current?.handle
-      if (handle === undefined) return []
-      const stdout = readStdout(handle)
-      const stderr = readStderr(handle)
+      const live = current
+      if (live === undefined) return []
+      const stdout = live.stream !== undefined ? live.stream.acc.fallbackText() : readStdout(live.handle)
+      const stderr = readStderr(live.handle)
       return textBlocks(stderr.length > 0 ? `${stdout}\n${stderr}` : stdout)
     }
 
@@ -1243,28 +1817,45 @@ class AntigravitySubagentProvider implements SubagentProvider {
       try {
         // A cancellation that arrived before the spawn must not spawn at all.
         if (cancelled || request.signal.aborted) return { output: [], stopReason: 'aborted' }
-        let handle = spawnOnce(plan.jsonMode)
+        let format: TraceTransport = streaming ? 'stream-json' : plan.jsonMode ? 'json' : 'text'
+        recorder?.start({
+          mode: observe.mode ?? (conversationId !== undefined ? 'followup' : 'foreground'),
+          label: plan.label,
+          resumed: conversationId !== undefined,
+          ...(conversationId !== undefined ? { conversation_id: conversationId } : {}),
+          transport: format,
+          supervision: plan.supervisor !== undefined ? 'enforced' : 'off',
+          model: plan.selection.model ?? null,
+          effort: plan.selection.effort ?? null,
+          model_source: plan.selection.source,
+          ...(plan.sharedSkills.length > 0 ? { shared_skills: plan.sharedSkills } : {}),
+        })
+        let run = spawnOnce(format)
         armWatchdog()
-        let outcome = await handle.done
-        let stdout = readStdout(handle)
-        let stderr = readStderr(handle)
+        let outcome = await run.handle.done
+        if (run.stream !== undefined) await settleWithin(run.stream.drained, config.disposeGraceMs)
+        let stderr = readStderr(run.handle)
         // Only when the probe failed and we assumed --output-format support:
         // a build that actually rejects the flag gets one retry in text mode.
         if (
           !cancelled &&
           !request.signal.aborted &&
-          plan.jsonMode &&
+          format !== 'text' &&
           !plan.support.probed &&
           outcome.exitCode !== 0 &&
           isUnknownFlagError(stderr)
         ) {
-          handle.terminate()
-          handle = spawnOnce(false)
+          run.handle.terminate()
+          format = 'text'
+          recorder?.transport('text', 'agy rejected --output-format; retried once in text mode (final-only, no step records)')
+          run = spawnOnce('text')
           armWatchdog()
-          outcome = await handle.done
-          stdout = readStdout(handle)
-          stderr = readStderr(handle)
+          outcome = await run.handle.done
+          stderr = readStderr(run.handle)
         }
+        lastOutcome = { exitCode: outcome.exitCode, signal: outcome.signal ?? null }
+        lastStderr = stderr
+        const stdout = run.stream !== undefined ? run.stream.acc.fallbackText() : readStdout(run.handle)
         if (cancelled || request.signal.aborted) return { output: textBlocks(stdout), stopReason: 'aborted' }
         if (timedOut) {
           return {
@@ -1279,11 +1870,11 @@ class AntigravitySubagentProvider implements SubagentProvider {
           }
         }
 
-        const parsed = tryParseJsonOutput(stdout)
+        const parsed = run.stream !== undefined ? run.stream.acc.reply() : tryParseJsonOutput(stdout)
         if (parsed !== undefined) {
           const conversation = parsed.conversation_id
           if (parsed.status === 'SUCCESS' && typeof parsed.response === 'string') {
-            this.remember(plan.id, conversation, plan.childCwd, plan.label)
+            this.remember(plan.id, conversation, plan.childCwd, plan.label, plan.selection)
             return { output: textBlocks(parsed.response), stopReason: 'completed' }
           }
           const detail = this.maybeAutoLogin(
@@ -1291,11 +1882,13 @@ class AntigravitySubagentProvider implements SubagentProvider {
               ? parsed.error
               : stderr.trim() || `agy exited with code ${String(outcome.exitCode)}`,
           )
-          this.remember(plan.id, conversation, plan.childCwd, plan.label)
+          this.remember(plan.id, conversation, plan.childCwd, plan.label, plan.selection)
           return { output: textBlocks(detail), stopReason: 'error' }
         }
+        // A stream that never reached its terminal result still identified the conversation.
+        if (run.stream !== undefined) this.remember(plan.id, run.stream.acc.conversationId, plan.childCwd, plan.label, plan.selection)
 
-        // Plain-text path (text mode or non-JSON stdout).
+        // Plain-text path (text mode, non-JSON stdout, or a stream without a terminal result).
         if (outcome.exitCode === 0) {
           if (stdout.trim().length === 0) {
             return {
@@ -1323,6 +1916,29 @@ class AntigravitySubagentProvider implements SubagentProvider {
       onAbort,
       onError: (error, stopReason) => ctx.logger.warn(`${PREFIX}: agy run failed (${stopReason}): ${error.message}`),
     })
+    // Supervisor files are collected and removed once the run settles; run_end
+    // lands before any caller links evidence (reaction order).
+    void result.then((settled) => {
+      const supervision = finishSupervision(plan)
+      if (recorder !== undefined) {
+        if (supervision !== undefined) recorder.supervision(supervision)
+        const wasCancelled = cancelled || request.signal.aborted
+        recorder.end({
+          outcome: timedOut ? 'timeout' : wasCancelled || settled.stopReason === 'aborted' ? 'cancelled'
+            : settled.stopReason === 'completed' ? 'completed' : 'failed',
+          exit_code: lastOutcome?.exitCode ?? null,
+          signal: lastOutcome?.signal ?? null,
+          timed_out: timedOut,
+          cancelled: wasCancelled,
+          stderr: lastStderr,
+          agy_error: parseAgyErrorLine(lastStderr),
+          ...(settled.stopReason === 'completed' ? {} : {
+            diagnostic: settled.output.map((block) => (block.type === 'text' ? block.text : '')).join('').slice(0, 1000),
+          }),
+          ...(supervision !== undefined ? { supervision } : {}),
+        })
+      }
+    })
     // Track for the tasks/cancel tools; released when the result settles.
     this.trackActive(
       plan.id,
@@ -1335,6 +1951,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
           cancelled = true
           ensureTerminated()
         },
+        ...(recorder !== undefined ? { traceKey } : {}),
       },
       result,
     )
@@ -1370,25 +1987,25 @@ class AntigravitySubagentProvider implements SubagentProvider {
    * `conversation_id` from the init event, and persists the task record when
    * done. The final read carries a `[task: ...]` line for follow-ups.
    */
-  async startBackground(request: SubagentStartRequest, extraDirs: readonly string[], options: { cwd?: string; model?: string; effort?: string } = {}): Promise<AntigravityBackgroundHandle> {
+  async startBackground(request: SubagentStartRequest, extraDirs: readonly string[], options: AgyRunOptions = {}): Promise<AntigravityBackgroundHandle> {
     const { ctx, config } = this
     const plan = await this.spawnPlan(request as ResolvedSubagentStartRequest, undefined, undefined, [...config.addDirs, ...extraDirs], config.backgroundTimeoutMs, options)
     const id = plan.id
     const label = plan.label
     const ceiling = config.backgroundTimeoutMs
     const baseline = captureWorkspace(plan.childCwd)
+    const observe = options.stream ?? {}
+    const traceKey = observe.traceKey ?? (id as unknown as string)
+    const recorder = this.createRecorder(traceKey, id as unknown as string, plan.childCwd, request.parent, observe)
+    const format: TraceTransport = plan.streamMode ? 'stream-json' : plan.jsonMode ? 'json' : 'text'
 
     let timedOut = false
     let visible = ''
     let readOffset = 0
-    let sawDelta = false
-    let conversationId: string | undefined
-    let finalStatus: string | undefined
-    let finalResponse: string | undefined
-    let finalError: string | undefined
     let taskLine = ''
     let taskLineEmitted = false
     let handle: SubprocessHandle | undefined
+    let live: LiveStream | undefined
     let watchdog: NodeJS.Timeout | undefined
     let cancelledByRequest = false
     const controller = new AbortController()
@@ -1421,62 +2038,19 @@ class AntigravitySubagentProvider implements SubagentProvider {
       clearTimeout(watchdog)
     }
 
-    /** Consume one NDJSON line of the stream-json protocol (or a bare json reply in fallback mode). */
-    const consumeLine = (line: string): void => {
-      let obj: unknown
-      try {
-        obj = JSON.parse(line)
-      } catch {
-        return
-      }
-      if (obj === null || typeof obj !== 'object') return
-      const event = (obj as { event?: unknown }).event
-      if (event === 'init') {
-        const cid = (obj as { conversation_id?: unknown }).conversation_id
-        if (typeof cid === 'string' && cid.length > 0) conversationId = cid
-        return
-      }
-      if (event === 'step_update') {
-        const payload = (obj as { step_update?: unknown }).step_update
-        if (payload !== null && typeof payload === 'object') {
-          const p = payload as { text_delta?: unknown; state?: unknown; step_type?: unknown }
-          const delta = p.text_delta
-          if (typeof delta === 'string' && delta.length > 0) {
-            sawDelta = true
-            appendVisible(delta)
-          }
-          // Compact progress marker for every non-text step (tool calls,
-          // checkpoints...), so a job_output poll shows what agy is doing.
-          const stepType = typeof p.step_type === 'string' ? p.step_type : ''
-          if (p.state === 'DONE' && stepType.length > 0 && stepType !== 'agent_response' && stepType !== 'user_input' && stepType !== 'unknown') {
-            appendVisible(`\n[agy: ${stepType} step done]\n`)
-          }
-        }
-        return
-      }
-      if (event === 'result') {
-        const payload = (obj as { result?: unknown }).result
-        if (payload !== null && typeof payload === 'object') {
-          const p = payload as { status?: unknown; response?: unknown; error?: unknown }
-          if (typeof p.status === 'string') finalStatus = p.status
-          if (typeof p.response === 'string') finalResponse = p.response
-          if (typeof p.error === 'string') finalError = p.error
-        }
-        return
-      }
-      // Bare `--output-format json` reply (fallback when stream-json is
-      // unavailable): the whole object is the final result.
-      const p = obj as { conversation_id?: unknown; status?: unknown; response?: unknown; error?: unknown }
-      if (typeof p.conversation_id === 'string' && p.conversation_id.length > 0) conversationId = p.conversation_id
-      if (typeof p.status === 'string') finalStatus = p.status
-      if (typeof p.response === 'string') finalResponse = p.response
-      if (typeof p.error === 'string') finalError = p.error
+    /** One decoded stream-json event (or bare json reply in fallback mode): live text, progress marker, trace. */
+    const onEvent = (event: AgyStreamEvent): void => {
+      recorder?.onEvent(event)
+      if (event.kind !== 'step') return
+      if (event.textDelta !== undefined && event.textDelta.length > 0) appendVisible(event.textDelta)
+      // Compact progress marker for tool and other non-text steps, so a
+      // job_output poll shows what agy is doing.
+      appendVisible(progressMarker(event))
     }
 
     const spawnOnce = (): void => {
       const argv = [...plan.baseArgv]
-      if (plan.streamMode) argv.push('--output-format', 'stream-json')
-      else if (plan.jsonMode) argv.push('--output-format', 'json')
+      if (format !== 'text') argv.push('--output-format', format)
       handle = ctx.subprocess.spawn({
         argv,
         cwd: plan.childCwd,
@@ -1490,36 +2064,37 @@ class AntigravitySubagentProvider implements SubagentProvider {
         env: plan.env,
       })
       armWatchdog()
-      let buffer = ''
-      handle.stdout?.on('data', (chunk: Buffer) => {
-        buffer += chunk.toString('utf8')
-        let idx: number
-        while ((idx = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, idx).trim()
-          buffer = buffer.slice(idx + 1)
-          if (line.length > 0) consumeLine(line)
-        }
-      })
-      handle.stdout?.on('end', () => {
-        const tail = buffer.trim()
-        if (tail.length > 0) consumeLine(tail)
-      })
+      // UTF-8-safe line splitting: a multi-byte character split across stdout
+      // chunks is decoded intact instead of turning into replacement chars.
+      live = attachStream(handle.stdout, onEvent)
     }
 
     const done = (async (): Promise<{ status: 'killed' | 'completed' | 'failed'; detail: string }> => {
       let status: 'killed' | 'completed' | 'failed'
       let detail: string
       let evidenceStatus: ExecutionStatus = 'failed'
+      let exitCode: number | null = null
+      let exitSignal: string | null = null
+      let stderr = ''
+      recorder?.start({
+        mode: observe.mode ?? 'background', label, resumed: false, transport: format,
+        supervision: plan.supervisor !== undefined ? 'enforced' : 'off',
+        model: plan.selection.model ?? null, effort: plan.selection.effort ?? null, model_source: plan.selection.source,
+      })
       try {
         spawnOnce()
         const outcome = await handle!.done
-        const stderr = handle!.collected?.stderr?.readFrom(0).text ?? ''
+        if (live !== undefined) await settleWithin(live.drained, config.disposeGraceMs)
+        exitCode = outcome.exitCode
+        exitSignal = outcome.signal ?? null
+        stderr = handle!.collected?.stderr?.readFrom(0).text ?? ''
         const classified = classifyBackgroundTermination({
           timedOut, cancelledByRequest, signal: outcome.signal ?? null,
-          finalStatus, exitCode: outcome.exitCode,
+          finalStatus: live?.acc.status, exitCode: outcome.exitCode,
         })
         status = classified.jobStatus
         evidenceStatus = classified.evidenceStatus
+        const finalError = live?.acc.error
         if (evidenceStatus === 'timeout') {
           detail = `agy did not finish within ${ceiling + config.watchdogMarginMs}ms (ceiling ${ceiling}ms + watchdog margin); the process tree was terminated`
         } else if (cancelledByRequest) {
@@ -1542,10 +2117,26 @@ class AntigravitySubagentProvider implements SubagentProvider {
         disarmWatchdog()
         plan.releasePromptFile()
       }
-      this.remember(id, conversationId, plan.childCwd, label)
+      const conversationId = live?.acc.conversationId
+      const supervision = finishSupervision(plan)
+      if (supervision !== undefined) recorder?.supervision(supervision)
+      recorder?.end({
+        ...(supervision !== undefined ? { supervision } : {}),
+        outcome: evidenceStatus,
+        exit_code: exitCode,
+        signal: exitSignal,
+        timed_out: timedOut,
+        cancelled: cancelledByRequest,
+        stderr,
+        agy_error: parseAgyErrorLine(stderr),
+        ...(evidenceStatus === 'completed' ? {} : { diagnostic: detail }),
+      })
+      this.remember(id, conversationId, plan.childCwd, label, plan.selection)
       try {
-        saveEvidence(collectEvidence(baseline, id, evidenceStatus, conversationId,
-          evidenceStatus === 'completed' ? undefined : detail), config.evidenceDir)
+        const evidence = collectEvidence(baseline, id, evidenceStatus, conversationId,
+          evidenceStatus === 'completed' ? undefined : detail)
+        saveEvidence(evidence, config.evidenceDir)
+        recorder?.evidence(evidence)
       } catch (error) {
         ctx.logger.warn(`${PREFIX}: failed to collect background evidence: ${String(error)}`)
       }
@@ -1559,10 +2150,13 @@ class AntigravitySubagentProvider implements SubagentProvider {
         taskLine = '\n[task: (none — this agy build did not provide a conversation_id)]'
       }
       taskLine += `\n[review: pending; use ${config.evidenceToolName} with task ${id}]`
+      if (recorder !== undefined) taskLine += `\n[trace: ${config.traceToolName} with id ${traceKey}]`
       // A stream-json build always streams the response text; only patch in
       // the final response when the fallback (json/text) mode delivered none.
-      if (finalResponse !== undefined && finalResponse.length > 0 && !sawDelta) {
-        appendVisible(finalResponse)
+      const finalResponse = live?.acc.response
+      if (live !== undefined && !live.acc.sawDelta) {
+        if (finalResponse !== undefined && finalResponse.length > 0) appendVisible(finalResponse)
+        else if (!live.acc.sawTerminal) appendVisible(live.acc.fallbackText())
       }
       return { status, detail }
     })()
@@ -1585,7 +2179,10 @@ class AntigravitySubagentProvider implements SubagentProvider {
     }
 
     // Track for the tasks/cancel tools; released when the job settles.
-    this.trackActive(id, { label, cwd: plan.childCwd, startedAt: Date.now(), background: true, cancel }, done)
+    this.trackActive(id, {
+      label, cwd: plan.childCwd, startedAt: Date.now(), background: true, cancel,
+      ...(recorder !== undefined ? { traceKey } : {}),
+    }, done)
     return { id, cancel, done, readOutput }
   }
 }
@@ -1705,6 +2302,39 @@ function reviewSummary(value: JsonValue): string {
     ' files changed; execution=' + evidence.execution_status +
     '; review=pending; independent validation required]'
 }
+/** Model-facing rendering of one trace page: state first, then compact records. */
+function renderTrace(id: string, source: string, summary: TraceSummary, events: TraceRecord[], nextCursor: number, hasMore: boolean, config: Config): string {
+  const lines: string[] = []
+  lines.push(`AGY trace ${id} (${summary.kind === 'native' ? 'native child' : summary.kind === 'chat' ? 'main chat session' : 'task'}) — ${source}`)
+  const life = summary.lifecycle
+  lines.push(`lifecycle: started=${life.started ? 'yes' : 'no'} execution=${life.execution} evidence=${life.evidence} review=pending (independent DSH verification required)`)
+  const run = summary.current_run
+  if (run !== null) {
+    const parts = [`runs=${summary.runs}`, `current run ${String(run.run)}`, `mode=${String(run.mode)}`, `transport=${String(run.transport)}`]
+    if (run.conversation_id) parts.push(`conversation=${String(run.conversation_id)}`)
+    parts.push(`steps=${String(run.steps)}`, `tool_calls=${String(run.tool_calls)}`, `tool_errors=${String(run.tool_errors)}`)
+    if (run.result_status) parts.push(`result=${String(run.result_status)}`)
+    lines.push(parts.join(' '))
+    const running = run.running_tool as { step?: unknown; tool?: unknown } | null
+    if (running) lines.push(`running now: ${String(running.tool)} (step ${String(running.step)})`)
+    const evidence = run.evidence as { task?: unknown; changed_files_total?: unknown; evidence_complete?: unknown } | null
+    if (evidence) lines.push(`evidence: ${String(evidence.changed_files_total)} changed file(s), complete=${String(evidence.evidence_complete)} — details: ${config.evidenceToolName} task ${String(evidence.task)}`)
+    const supervision = run.supervision as { allowed?: unknown; denied?: unknown; reworks?: unknown; tampered?: unknown; state?: unknown } | string | undefined
+    if (supervision !== undefined && supervision !== 'off') {
+      if (typeof supervision === 'string') lines.push(`supervision: ${supervision}`)
+      else if (supervision.state !== undefined) lines.push(`supervision: enforced, ${String(supervision.state)}`)
+      else lines.push(`supervision: enforced, allowed=${String(supervision.allowed)} denied=${String(supervision.denied)} reworks=${String(supervision.reworks)}${Array.isArray(supervision.tampered) && supervision.tampered.length > 0 ? ` TAMPERED: ${supervision.tampered.join(', ')}` : ''}`)
+    }
+  }
+  const tools = Object.entries(summary.tools_used)
+  if (tools.length > 0) lines.push('agy tools: ' + tools.map(([name, count]) => `${name}×${count.calls}${count.errors > 0 ? ` (${count.errors} error)` : ''}`).join(', '))
+  if (summary.truncated) lines.push('note: trace reached its cap; later step records were dropped (lifecycle records kept)')
+  lines.push(`records (${events.length} of ${summary.total_events}):`)
+  for (const record of events) lines.push('  ' + renderTraceRecord(record))
+  lines.push(`next_cursor: ${nextCursor}  has_more: ${hasMore ? 'true' : 'false'}`)
+  return lines.join('\n')
+}
+
 export function apply(ctx: Context, config: Config): void {
   assertPositiveFinite(PREFIX, 'disposeGraceMs', config.disposeGraceMs)
   assertPositiveFinite(PREFIX, 'watchdogMarginMs', config.watchdogMarginMs)
@@ -1712,7 +2342,14 @@ export function apply(ctx: Context, config: Config): void {
   const configuredCwd = config.cwd.length > 0 ? validateConfiguredCwd(PREFIX, config.cwd) : undefined
 
   // Provider registration (effect-scoped: stop/update/unload removes it).
-  const provider = new AntigravitySubagentProvider(ctx, config, configuredCwd)
+  const traces = config.traceEnabled
+    ? new TraceStore(
+      config.traceDir.length > 0 ? config.traceDir : join(pluginBaseDir() || join(homeDirectory(), '.dsh'), 'agy-traces'),
+      { ...DEFAULT_TRACE_LIMITS, maxEventsPerTrace: config.traceMaxEvents, maxTraces: config.traceMaxFiles },
+      (message) => ctx.logger.warn(`${PREFIX}: ${message}`),
+    )
+    : undefined
+  const provider = new AntigravitySubagentProvider(ctx, config, configuredCwd, traces)
   ctx.effect(
     () => ctx.subagents.registerProvider(provider),
     `${PREFIX}: provider ${config.providerName}`,
@@ -1725,45 +2362,216 @@ export function apply(ctx: Context, config: Config): void {
       ...config,
       registryPath: config.nativeRegistryPath || join(pluginBaseDir(), 'agy-native-sessions.json'),
     }
-    const nativeAdapter = new NativeAgyLlmAdapter(config.nativeLlmProvider, async (options) => {
+    /**
+     * Per-turn CLI arguments for the session's DSH route. DSH persists the route
+     * (model + reasoningEffort) in the child descriptor; agy reverts to its
+     * default model when resuming without --model, so the route is sent on
+     * EVERY turn (spawnPlan maps it onto --model/--effort). agy-cli keeps the
+     * plugin/CLI default exactly as before.
+     */
+    const nativeSelection = (model: string, reasoningEffort: string | undefined): { model?: string; effort?: string } =>
+      model === NATIVE_MODEL_ID ? {} : { model, effort: reasoningEffort ?? '' }
+
+    /** Route for a child that names no model: nativeDefaultModel/Effort, validated when the listing works. */
+    const nativeDefaultRoute = async (): Promise<{ model: string; effort?: string; source: 'plugin-default' | 'cli-default' }> => {
+      const model = config.nativeDefaultModel.trim()
+      if (model.length === 0) return { model: NATIVE_MODEL_ID, source: 'cli-default' }
+      const effort = config.nativeDefaultEffort.trim().toLowerCase() || undefined
+      let models: AgyBaseModel[] | undefined
+      try {
+        models = await provider.models.list()
+      } catch (error) {
+        ctx.logger.warn(`${PREFIX}: cannot validate default AGY model ${model} (${error instanceof Error ? error.message : String(error)}); using it unvalidated`)
+        return { model, ...(effort !== undefined ? { effort } : {}), source: 'plugin-default' }
+      }
+      try {
+        const resolved = resolveSelection(models, model, effort)
+        return { model: resolved.model.id, ...(resolved.effort !== undefined ? { effort: resolved.effort } : {}), source: 'plugin-default' }
+      } catch (error) {
+        ctx.logger.warn(`${PREFIX}: default AGY model ${model} is not available (${error instanceof Error ? error.message : String(error)}); falling back to the CLI default`)
+        return { model: NATIVE_MODEL_ID, source: 'cli-default' }
+      }
+    }
+
+    /**
+     * Hand DSH image blocks to AGY as files: copy each from the DSH attachment
+     * store into a per-session temp directory (passed with --add-dir) and refer
+     * to its path, so AGY opens it with its own viewer (verified on 1.4.0).
+     */
+    const saveImages = async (messages: GenerateOptions['messages'], sessionId: string, signal: AbortSignal | undefined): Promise<{ dir?: string; paths: Map<string, string> }> => {
+      const paths = new Map<string, string>()
+      const blocks: { attachment: { attachmentId: string; mediaType: string } }[] = []
+      for (const message of messages) {
+        if (!Array.isArray(message.content)) continue
+        for (const block of message.content as unknown[]) {
+          const candidate = block as { type?: unknown; attachment?: { attachmentId?: unknown; mediaType?: unknown } }
+          if (candidate?.type === 'image' && typeof candidate.attachment?.attachmentId === 'string' && typeof candidate.attachment.mediaType === 'string') {
+            blocks.push(candidate as { attachment: { attachmentId: string; mediaType: string } })
+          }
+        }
+      }
+      if (blocks.length === 0) return { paths }
+      const store = (ctx as unknown as { get(name: string): unknown }).get('attachments') as
+        | { readImage(ref: unknown, signal?: AbortSignal): Promise<{ data: Uint8Array }> }
+        | undefined
+      if (store === undefined || typeof store.readImage !== 'function') return { paths }
+      const root = join(tmpdir(), 'dsh-agy-images')
+      pruneOldDirectories(root, 7 * 24 * 60 * 60 * 1000)
+      const dir = join(root, createHash('sha256').update(sessionId).digest('hex').slice(0, 24))
+      mkdirSync(dir, { recursive: true })
+      for (const block of blocks) {
+        const id = block.attachment.attachmentId
+        if (paths.has(id)) continue
+        const ext = block.attachment.mediaType === 'image/jpeg' ? 'jpg' : block.attachment.mediaType.replace(/^image\//, '').replace(/[^a-z0-9]/g, '') || 'img'
+        const file = join(dir, `${createHash('sha256').update(id).digest('hex').slice(0, 24)}.${ext}`)
+        try {
+          if (!existsSync(file)) writeFileSync(file, (await store.readImage(block.attachment, signal)).data)
+          paths.set(id, file)
+        } catch (error) {
+          ctx.logger.warn(`${PREFIX}: could not hand an image attachment to AGY: ${String(error)}`)
+        }
+      }
+      return paths.size > 0 ? { dir, paths } : { paths }
+    }
+    const imagePlaceholder = (paths: Map<string, string>) => (block: { type: 'image'; attachment?: unknown }): string | undefined => {
+      const ref = block.attachment as { attachmentId?: string; width?: number; height?: number; mediaType?: string; name?: string } | undefined
+      const file = ref?.attachmentId !== undefined ? paths.get(ref.attachmentId) : undefined
+      if (file === undefined) return undefined
+      return `[Attached image${ref?.name ? ` "${ref.name}"` : ''} (${String(ref?.width ?? '?')}x${String(ref?.height ?? '?')}, ${ref?.mediaType ?? 'image'}) saved at ${file} — open it with your file viewing tool before answering about it.]`
+    }
+
+    const nativeAdapter = new NativeAgyLlmAdapter(config.nativeLlmProvider, async (options, sink?: NativeTextSink) => {
       const childId = options.sessionId
-      if (!childId) throw new Error(`${PREFIX}: native adapter requires a DSH child session id`)
+      if (!childId) throw new Error(`${PREFIX}: native adapter requires a DSH session id`)
       const child = ctx.agents.get(childId)
-      if (!child) throw new Error(`${PREFIX}: native child agent ${childId} is not resident`)
+      if (!child) throw new Error(`${PREFIX}: native agent ${childId} is not resident`)
+      // A DSH child (antigravity_native_start or DSH subagent delegation) keeps the
+      // strict, fail-closed transport. A main session that picked an AGY model in
+      // DSH's model list gets the lenient rendering (no DSH system prompt, DSH
+      // tool traffic and oversized history omitted with notes).
+      const isChild = (child.session.header as { origin?: string }).origin === 'subagent' || traces?.readMeta(childId)?.kind === 'native'
+      if (!isChild && !config.nativeMainSessionEnabled) {
+        throw new Error(`${PREFIX}: the AGY native transport only serves DSH child sessions (${config.nativeStartToolName}); nativeMainSessionEnabled is off`)
+      }
+      const cli = nativeSelection(options.model, options.reasoningEffort !== undefined ? String(options.reasoningEffort) : undefined)
+      const signal = options.signal ?? new AbortController().signal
+      const owner = isChild ? agentIdOf((child as { parentAgent?: unknown }).parentAgent) : (childId as string)
+      const images = await saveImages(options.messages, childId, signal)
+      const dirs = images.dir !== undefined ? [images.dir] : []
+      const image = imagePlaceholder(images.paths)
+      const onText = sink !== undefined ? { onText: (delta: string) => sink.text(delta) } : {}
+      // AGY reports usage per model call; a DSH request is one AGY turn.
+      const usage = new TurnUsage()
+      const progress = !isChild && config.nativeChatToolProgress && sink !== undefined
+      const onEvent = (event: AgyStreamEvent): void => {
+        usage.observe(event)
+        if (progress) {
+          const line = chatProgressLine(event)
+          if (line !== undefined) sink.text(line)
+        }
+      }
+      const timeoutMs = config.nativeTimeoutMs
+
+      // DSH auxiliary calls (session titles, compaction) share the session id but
+      // are not conversation turns: run them one-shot so they never touch the
+      // session's AGY conversation or its evidence.
+      if (options.purpose !== undefined) {
+        const text = nativePrompt(options, false, { mode: 'lenient', includeSystem: true, image }) +
+          '\n\n(Auxiliary request from the host application: answer directly in text. Do not use any tools and do not modify files.)'
+        const auxCwd = resolveChildCwd(PREFIX, configuredCwd, child.session.header.cwd)
+        const run = await provider.startWithDirs({
+          label: `AGY ${options.purpose}`, parent: child, prompt: [{ type: 'text' as const, text }], signal,
+        }, dirs, { cwd: auxCwd, ...cli, timeoutMs, stream: { traceKey: `${childId}::${options.purpose}`, traceKind: isChild ? 'native' : 'chat', owner, mode: options.purpose, ...onText, onEvent: usage.observe } })
+        try {
+          const result = await run.result
+          if (result.stopReason !== 'completed') {
+            throw new Error(`${PREFIX}: AGY ${options.purpose} call ended with ${result.stopReason} (${result.diagnostic ?? 'no diagnostic'})`)
+          }
+          return { text: result.output.filter((block) => block.type === 'text').map((block) => block.text).join(''), ...usage.toDsh() }
+        } finally {
+          await run.dispose()
+        }
+      }
+
       const previous = loadTaskRegistry(nativeIndexConfig, ctx.logger)[childId]
       const cwd = previous?.cwd ?? resolveChildCwd(PREFIX, configuredCwd, child.session.header.cwd)
-      const prompt = nativePrompt(options, previous !== undefined)
+      const prompt = nativePrompt(options, previous !== undefined, { mode: isChild ? 'strict' : 'lenient', image })
       const request = {
-        label: 'AGY native child transport',
+        label: isChild ? 'AGY native child transport' : 'AGY native chat transport',
         parent: child,
         prompt: [{ type: 'text' as const, text: prompt }],
-        signal: options.signal ?? new AbortController().signal,
+        signal,
+      }
+      // One trace per DSH session (child owner recorded in prepareContinuable;
+      // a main session owns its own trace); each AGY turn is one run inside it.
+      const stream: AgyRunStreamOptions = {
+        traceKey: childId,
+        // 'chat' keeps a main session from later being mistaken for a native child.
+        traceKind: isChild ? 'native' : 'chat',
+        childId,
+        owner,
+        mode: `${isChild ? 'native' : 'native-chat'}-${previous ? 'followup' : 'first'}`,
+        ...onText,
+        onEvent,
+      }
+      let before: ReturnType<typeof captureWorkspace> | undefined
+      try {
+        before = captureWorkspace(cwd)
+      } catch (error) {
+        ctx.logger.warn(`${PREFIX}: native evidence baseline failed: ${String(error)}`)
       }
       const run = previous
-        ? await provider.followup(request, previous.conversationId, cwd)
-        : await provider.startWithDirs(request, [], { cwd })
+        ? await provider.followup(request, previous.conversationId, cwd, { stream, dirs, timeoutMs, ...cli })
+        : await provider.startWithDirs(request, dirs, { cwd, stream, timeoutMs, ...cli })
       try {
         const result = await run.result
+        if (before !== undefined) {
+          // Local file evidence for this turn, linked to the session's trace.
+          try {
+            const status: ExecutionStatus = result.stopReason === 'completed' ? 'completed'
+              : result.stopReason === 'aborted' ? 'cancelled'
+              : executionErrorStatus(result.diagnostic ?? result.output.map((block) => (block.type === 'text' ? block.text : '')).join(''))
+            const evidence = collectEvidence(before, run.id, status, provider.recordOf(run.id)?.conversationId,
+              status === 'completed' ? undefined : (result.diagnostic ?? `native AGY transport ended with ${result.stopReason}`))
+            saveEvidence(evidence, config.evidenceDir)
+            provider.recordEvidence(childId, run.id, evidence)
+          } catch (error) {
+            ctx.logger.warn(`${PREFIX}: native evidence collection failed: ${String(error)}`)
+          }
+        }
         if (result.stopReason !== 'completed') {
           throw new Error(`${PREFIX}: native AGY transport ended with ${result.stopReason} (${result.diagnostic ?? 'no diagnostic'})`)
         }
         const record = provider.recordOf(run.id)
         if (!record?.conversationId) {
-          throw new Error(`${PREFIX}: AGY gave no conversation_id; native child cannot promise durable conversation recovery`)
+          throw new Error(`${PREFIX}: AGY gave no conversation_id; this session cannot promise durable conversation recovery`)
         }
         await updateTaskRegistry(nativeIndexConfig, (records) => {
           records[childId] = {
             conversationId: record.conversationId,
             cwd: record.cwd,
-            label: 'AGY native child',
+            label: isChild ? 'AGY native child' : 'AGY native chat',
             createdAt: previous?.createdAt ?? Date.now(),
           }
         }, ctx.logger)
-        return result.output.filter((block) => block.type === 'text').map((block) => block.text).join('')
+        return { text: result.output.filter((block) => block.type === 'text').map((block) => block.text).join(''), ...usage.toDsh() }
       } finally {
         await run.dispose()
       }
-    })
+    }, {
+      list: async () => (await provider.models.list()).map((model) => {
+        const effort = model.id === config.nativeDefaultModel && (model.efforts as string[]).includes(config.nativeDefaultEffort)
+          ? config.nativeDefaultEffort : defaultEffortFor(model)
+        const contextWindow = config.nativeContextWindows[model.id]
+        return {
+          id: model.id,
+          name: model.name,
+          efforts: model.efforts,
+          ...(effort !== undefined ? { defaultEffort: effort } : {}),
+          ...(typeof contextWindow === 'number' && contextWindow > 0 ? { contextWindow } : {}),
+        }
+      }),
+    }, config.nativeImageInput)
     ctx.effect(
       () => ctx.llm.registerAdapter([config.nativeLlmProvider], nativeAdapter),
       `${PREFIX}: experimental native CLI model provider ${config.nativeLlmProvider}`,
@@ -1771,10 +2579,12 @@ export function apply(ctx: Context, config: Config): void {
     ctx.effect(
       () => ctx.tools.register(defineTool({
         name: config.nativeStartToolName,
-        description: 'EXPERIMENTAL: Create a REAL DSH continuable child Session/Agent backed by logged-in Antigravity CLI. Child appears in native subagent tree and accepts host send_message; the CLI uses its own tools, not DSH tools. Starts asynchronously; outputs are visible in the child Session, not returned by this tool. Workspace is the parent DSH session cwd. Does not report fake completion.',
+        description: 'EXPERIMENTAL: Create a REAL DSH continuable child Session/Agent backed by logged-in Antigravity CLI. Child appears in native subagent tree and accepts host send_message; the CLI uses its own tools, not DSH tools. Starts asynchronously; AGY\'s visible text streams into the child Session' + (traces !== undefined ? ', and its step/tool execution record is readable with ' + config.traceToolName + ' (id = childId) while it runs' : '') + '. Workspace is the parent DSH session cwd. Does not report fake completion; verify changes yourself.',
         parameters: {
           description: { type: 'string', required: true, description: 'Short label displayed in DSH native subagent tree.' },
           prompt: { type: 'string', required: true, description: 'Full standalone AGY task; use only the current parent workspace.' },
+          model: { type: 'string', description: 'Optional AGY model id from ' + config.modelsToolName + ' (base id like gemini-3.8-flash, or a CLI variant id like gemini-3.8-flash-low). Omit to use the CLI default model and effort. Locked for this child: every later turn re-sends it.' },
+          effort: { type: 'string', description: 'Optional effort for a model with effort variants (see ' + config.modelsToolName + '); requires model.' },
         },
         output: {
           schema: {
@@ -1784,17 +2594,49 @@ export function apply(ctx: Context, config: Config): void {
               childId: { type: 'string', required: true },
               messageId: { type: 'string', required: true },
               state: { type: 'string', required: true },
+              model: { type: 'string', required: true },
+              effort: { type: 'string' },
+              model_source: { type: 'string', required: true },
             },
           },
-          render: (_args: unknown, result: { childId: string; state: string }) => [
-            { type: 'text', text: `Native AGY child session ${result.childId}: ${result.state}. Check native subagent tree; use DSH send_message for follow-ups.` },
+          render: (_args: unknown, result: { childId: string; state: string; model: string; effort?: string; model_source: string }) => [
+            { type: 'text', text: `Native AGY child session ${result.childId}: ${result.state}. Requested AGY model: ${result.model === NATIVE_MODEL_ID ? 'CLI default model and effort' : result.model + (result.effort ? ` (effort ${result.effort})` : '')} [${result.model_source}; requested value — the effective model is reported in the trace when supervision is on]. Check native subagent tree; use DSH send_message for follow-ups.${traces !== undefined ? ` Live AGY step/tool record: ${config.traceToolName} with id ${result.childId}.` : ''}` },
           ],
         },
         isConcurrencySafe: () => true,
-        async execute(args: { description: string; prompt: string }, exec: ToolRunContext) {
+        async execute(args: { description: string; prompt: string; model?: string; effort?: string }, exec: ToolRunContext) {
           const parent = exec.agent
           if (!parent) throw new Error(`${PREFIX}: native start requires a calling DSH Agent`)
           if (!args.prompt.trim()) throw new Error(`${PREFIX}: native prompt must not be empty`)
+          // Validate BEFORE the child exists; the choice then lives in DSH's own descriptor.
+          const requestedModel = args.model?.trim() || undefined
+          const requestedEffort = args.effort?.trim().toLowerCase() || undefined
+          let route: { model: string; effort?: string; source: 'explicit' | 'plugin-default' | 'cli-default' }
+          if (requestedModel === NATIVE_MODEL_ID) {
+            if (requestedEffort !== undefined) {
+              throw new Error(`${PREFIX}: effort requires an explicit model (${NATIVE_MODEL_ID} runs the CLI's own default model and effort); see ${config.modelsToolName}`)
+            }
+            route = { model: NATIVE_MODEL_ID, source: 'cli-default' }
+          } else if (requestedModel === undefined) {
+            if (requestedEffort !== undefined) {
+              throw new Error(`${PREFIX}: effort requires an explicit model; see ${config.modelsToolName}`)
+            }
+            route = await nativeDefaultRoute()
+          } else {
+            let models: AgyBaseModel[]
+            try {
+              models = await provider.models.list()
+            } catch (error) {
+              throw new Error(`${PREFIX}: cannot verify AGY model "${requestedModel}": ${error instanceof Error ? error.message : String(error)}. Retry, or omit model to use the CLI default.`)
+            }
+            try {
+              const resolved = resolveSelection(models, requestedModel, requestedEffort)
+              route = { model: resolved.model.id, ...(resolved.effort !== undefined ? { effort: resolved.effort } : {}), source: 'explicit' }
+            } catch (error) {
+              if (error instanceof AgyModelSelectionError) throw new Error(`${PREFIX}: ${error.message}`)
+              throw error
+            }
+          }
           const childId = randomUUID() as SessionId
           const result = await ctx.subagents.startContinuable({
             provider: config.providerName,
@@ -1803,12 +2645,19 @@ export function apply(ctx: Context, config: Config): void {
             request: {
               parent,
               prompt: [{ type: 'text', text: args.prompt }],
-              agentOptions: { provider: config.nativeLlmProvider, model: NATIVE_MODEL_ID },
+              agentOptions: {
+                provider: config.nativeLlmProvider,
+                model: route.model,
+                ...(route.effort !== undefined ? { reasoningEffort: ReasoningEffortId(route.effort) } : {}),
+              },
               toolFilter: { allow: [] },
             },
             signal: exec.signal,
           })
-          return { childId: result.childId, messageId: result.messageId, state: 'accepted' }
+          return {
+            childId: result.childId, messageId: result.messageId, state: 'accepted',
+            model: route.model, ...(route.effort !== undefined ? { effort: route.effort } : {}), model_source: route.source,
+          }
         },
       })),
       `${PREFIX}: experimental native start tool ${config.nativeStartToolName}`,
@@ -1850,8 +2699,8 @@ export function apply(ctx: Context, config: Config): void {
                 'The complete, self-contained task for Antigravity. It does not share this conversation\'s context, so include everything it needs (files, paths, acceptance criteria, and what to return). Keep it under 30000 characters.',
             },
             cwd: { type: 'string', description: 'Optional absolute target working directory; evidence is collected here.' },
-            model: { type: 'string', description: 'Optional AGY model ID (overrides plugin default).' },
-            effort: { type: 'string', description: 'Optional low | medium | high | xhigh | max reasoning effort.' },
+            model: { type: 'string', description: 'Optional AGY model id from ' + config.modelsToolName + ' (overrides the plugin/CLI default; follow-ups keep it).' },
+            effort: { type: 'string', description: 'Optional effort for a model with effort variants (see ' + config.modelsToolName + ').' },
             dirs: {
               type: 'array',
               items: { type: 'string' },
@@ -1879,7 +2728,7 @@ export function apply(ctx: Context, config: Config): void {
             },
             render: (_args: unknown, value: { kind?: string; jobId?: string; task?: string; output?: unknown[]; evidence?: JsonValue }) => {
               if (value.kind === 'background') {
-                return [{ type: 'text', text: `started background job ${value.jobId ?? '(unknown)'} (AGY task ${value.task ?? '(unknown)'}) — read live output with job_output, stop with job_kill` }]
+                return [{ type: 'text', text: `started background job ${value.jobId ?? '(unknown)'} (AGY task ${value.task ?? '(unknown)'}) — read live output with job_output, stop with job_kill${traces !== undefined ? `, structured AGY step/tool record with ${config.traceToolName}` : ''}` }]
               }
               return [{ type: 'text', text: outputValueText(value.output ?? []) + (value.evidence ? reviewSummary(value.evidence) : '') }]
             },
@@ -1950,6 +2799,7 @@ export function apply(ctx: Context, config: Config): void {
             const settled = await settleWithEvidence(run, before, run.id, provider, config)
             if (args.dirs?.length) settled.evidence.warnings.push('Additional --add-dir paths are not covered by workspace evidence.')
             saveEvidence(settled.evidence, config.evidenceDir)
+            provider.recordEvidence(settled.runId, settled.runId, settled.evidence)
             const record = provider.recordOf(settled.runId)
             if (record !== undefined) {
               await updateTaskRegistry(config, (records) => {
@@ -2025,12 +2875,26 @@ export function apply(ctx: Context, config: Config): void {
               prompt: [{ type: 'text' as const, text: args.prompt }],
               parent,
               signal: exec.signal,
-              agyOptions: { conversationId: record.conversationId, cwd: record.cwd, model: args.model, effort: args.effort },
+              // agy resumes on its DEFAULT model unless --model is sent again: keep the
+              // conversation's recorded model/effort unless the caller overrides them
+              // (a new model drops the old effort, which may not exist for it).
+              agyOptions: {
+                conversationId: record.conversationId, cwd: record.cwd, traceKey: args.task,
+                ...(args.model !== undefined
+                  ? { model: args.model, ...(args.effort !== undefined ? { effort: args.effort } : {}) }
+                  : {
+                    ...(record.model !== undefined ? { model: record.model } : {}),
+                    ...(args.effort !== undefined ? { effort: args.effort } : record.effort !== undefined ? { effort: record.effort } : {}),
+                  }),
+              },
             } as AgyNativeRequest)
             const settled = await settleWithEvidence(run, before, args.task, provider, config)
+            provider.recordEvidence(args.task, settled.runId, settled.evidence)
             const refreshed = provider.recordOf(settled.runId)
             await updateTaskRegistry(config, (records) => {
-              records[args.task] = { ...record, createdAt: Date.now(), ...(refreshed !== undefined ? { conversationId: refreshed.conversationId } : {}) }
+              records[args.task] = refreshed !== undefined
+                ? { ...refreshed, cwd: record.cwd, label: record.label, createdAt: Date.now() }
+                : { ...record, createdAt: Date.now() }
             }, ctx.logger)
             return { ...settled, task: args.task, evidence: JSON.parse(JSON.stringify(settled.evidence)) as JsonValue }
           },
@@ -2066,6 +2930,111 @@ export function apply(ctx: Context, config: Config): void {
       }),
     ),
     `${PREFIX}: tool ${config.evidenceToolName}`,
+  )
+
+  // Trace tool: AGY's own execution record (steps, AGY-internal tool calls,
+  // results, cancellation, linked local evidence), paged by seq cursor.
+  if (traces !== undefined) {
+    ctx.effect(
+      () => ctx.tools.register(
+        defineTool({
+          name: config.traceToolName,
+          description:
+            'Read the durable execution trace of an Antigravity (agy) run you delegated, live or finished: AGY\'s own steps, AGY-INTERNAL tool calls (tool name, redacted parameters, output preview, errors), the final result, cancellation/timeout, optional supervision decisions (denied tool calls, stop-check rework), and the linked local file evidence. Pass a native child id (from ' + config.nativeStartToolName + ') or a task key (from ' + config.toolName + ', background jobs, or ' + config.followupToolName + '). Records come from agy stream-json: they are NOT DSH tool calls, AGY hidden reasoning is not available, and lifecycle.review is always pending — verify files, build and tests yourself (' + config.evidenceToolName + ' gives the file diff). Page with cursor = the previous next_cursor while a run is live. Only the delegating agent can read a trace.',
+          parameters: {
+            id: { type: 'string', required: true, description: 'Native child id or AGY task key.' },
+            cursor: { type: 'number', description: 'Return only records with seq greater than this (default 0 = from the start).' },
+            limit: { type: 'number', description: 'Maximum records to return (default 40, max 200).' },
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true },
+                source: { type: 'string', required: true },
+                summary: { type: 'json', required: true },
+                events: { type: 'array', required: true, items: { type: 'json' } },
+                next_cursor: { type: 'number', required: true },
+                has_more: { type: 'boolean', required: true },
+              },
+            },
+            render: (_args: unknown, value: { id: string; source: string; summary: JsonValue; events: unknown[]; next_cursor: number; has_more: boolean }) =>
+              [{ type: 'text', text: renderTrace(value.id, value.source, value.summary as unknown as TraceSummary, value.events as TraceRecord[], value.next_cursor, value.has_more, config) }],
+          },
+          isConcurrencySafe: () => true,
+          async execute(args: { id: string; cursor?: number; limit?: number }, exec: ToolRunContext) {
+            const caller = agentIdOf(exec.agent)
+            if (caller === null) throw new Error(`${PREFIX}: ${config.traceToolName} requires a calling DSH agent`)
+            const all = traces.readAll(args.id)
+            // Same message for "absent" and "not yours": traces never leak to other agents.
+            if (all === undefined || all.meta.owner === null || all.meta.owner !== caller) {
+              throw new Error(`${PREFIX}: no trace "${args.id}" accessible to this agent (only the delegating parent can read it; traces exist for runs started with tracing enabled)`)
+            }
+            const current = ctx.subagents.getProvider(config.providerName) as AntigravitySubagentProvider | undefined
+            const active = current instanceof AntigravitySubagentProvider ? current.activeRunsFor(args.id) : new Set<string>()
+            const cursor = Math.max(0, Math.floor(Number.isFinite(args.cursor) ? (args.cursor as number) : 0))
+            const limit = Math.max(1, Math.min(200, Math.floor(Number.isFinite(args.limit) ? (args.limit as number) : 40)))
+            const after = all.records.filter((record) => record.seq > cursor)
+            const events = after.slice(0, limit)
+            return {
+              id: args.id,
+              source: 'agy-cli stream-json (AGY-internal execution records; not DSH tool calls; hidden model reasoning is not exposed)',
+              summary: JSON.parse(JSON.stringify(summarizeTrace(all.meta, all.records, active))) as JsonValue,
+              events: JSON.parse(JSON.stringify(events)) as JsonValue[],
+              next_cursor: events.at(-1)?.seq ?? cursor,
+              has_more: after.length > events.length,
+            }
+          },
+        }),
+      ),
+      `${PREFIX}: tool ${config.traceToolName}`,
+    )
+  }
+
+  // Models tool: what "agy models" actually reports (no agent turn, no quota).
+  ctx.effect(
+    () => ctx.tools.register(
+      defineTool({
+        name: config.modelsToolName,
+        description: 'List the Antigravity CLI models this machine can use, straight from "agy models" (no agent turn, no quota). Effort variants are grouped: pass the base id as model and one of its efforts as effort (or pass a CLI variant id such as gemini-3.8-flash-low). Models without efforts take no effort. ' + NATIVE_MODEL_ID + ' means the CLI default model and effort. Use the ids with ' + config.nativeStartToolName + ' or the model/effort parameters of ' + config.toolName + '.',
+        parameters: {},
+        output: {
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              default_model: { type: 'string', required: true },
+              models: { type: 'array', required: true, items: { type: 'json' } },
+            },
+          },
+          render: (_args: unknown, value: { default_model: string; models: { id: string; name: string; efforts: string[]; default_effort: string | null; cli_ids: string[] }[] }) => [{
+            type: 'text',
+            text: [
+              `AGY models (from "agy models"); ${value.default_model} = CLI default model and effort (no --model/--effort):`,
+              ...value.models.map((model) => `- ${model.id} — ${model.name}; ${model.efforts.length > 0 ? `efforts: ${model.efforts.join(' | ')} (default ${model.default_effort ?? '-'})` : 'no effort variants'}; CLI ids: ${model.cli_ids.join(', ')}`),
+            ].join('\n'),
+          }],
+        },
+        isConcurrencySafe: () => true,
+        async execute() {
+          let models: AgyBaseModel[]
+          try {
+            models = await provider.models.list()
+          } catch (error) {
+            throw new Error(`${PREFIX}: could not list AGY models: ${error instanceof Error ? error.message : String(error)}. You can still pass a CLI model id from \`agy models\` directly; agy rejects unknown ids.`)
+          }
+          return {
+            default_model: NATIVE_MODEL_ID,
+            models: models.map((model) => ({
+              id: model.id, name: model.name, efforts: model.efforts,
+              default_effort: defaultEffortFor(model) ?? null, cli_ids: model.variants,
+            })) as unknown as JsonValue[],
+          }
+        },
+      }),
+    ),
+    `${PREFIX}: tool ${config.modelsToolName}`,
   )
 
   // Login-window tool: pop agy's interactive login on demand (also happens
@@ -2258,6 +3227,6 @@ export function apply(ctx: Context, config: Config): void {
   )
 
   ctx.logger.info(
-    `${PREFIX}: provider "${config.providerName}" + tools "${config.toolName}" / "${config.followupToolName}" / "${config.tasksToolName}" / "${config.cancelToolName}" ready (command: ${config.command}${config.model ? `, model: ${config.model}` : ''})`,
+    `${PREFIX}: provider "${config.providerName}" + tools "${config.toolName}" / "${config.followupToolName}" / "${config.tasksToolName}" / "${config.cancelToolName}"${traces !== undefined ? ` / "${config.traceToolName}"` : ''} / "${config.modelsToolName}" ready (command: ${config.command}${config.model ? `, model: ${config.model}` : ''})`,
   )
 }
