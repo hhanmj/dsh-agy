@@ -17,6 +17,19 @@ dsh plugin --profile web add ".\deploy\dsh-subagent-agy-reviewed"
 
 这里 `web` 只是示例，使用你实际启动的 DSH Profile。务必安装真实目录 `deploy/dsh-subagent-agy-reviewed`，**不要使用 `.tgz` 路径**：Tauri 日志已观察到 `INTERNAL_PLUGIN_DANGLING_LINK_UNINSTALLING` 和 `Recovery uninstall removed plugin`。目录部署文件仅在本地生成并被 `.gitignore` 排除。安装完成后重启后端，并首先检查插件有没有再次被卸载；如被卸载，检查桌面端日志再决定下一步，不要循环重装。避免同时进行插件市场批量更新。
 
+### v0.4.1 热修复部署（DSH 原生子代理收到工具定义时报错）
+
+若 Better Sidebar 已显示原生子代理，但子会话报错 `AGY native bridge: DSH tools are not supported`，原因是 DSH 0.2 在 `allow: []` 后仍可能暴露子代理本地作用域的工具定义。适配器现在在传给 AGY CLI 前剥离工具声明和工具历史，但仍拒绝真实工具消息或非文本输入；不会捏造 DSH 工具调用。
+
+为避免覆盖当前运行中的插件目录，可建立独立的修复目录（**仍为 v0.4.1**）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "F:\agy-subagebt\scripts\stage-local-install.ps1" -StageName dsh-subagent-agy-reviewed-hotfix
+dsh plugin --profile web add "F:\agy-subagebt\deploy\dsh-subagent-agy-reviewed-hotfix"
+```
+
+等待后台任务完成，再重启 DSH 后端；新建子代理进行文本 PONG 测试，不要继续之前报错的子会话。安装前确保没有并发的插件市场更新。
+
 ## 功能
 
 | 工具 | 用途 |

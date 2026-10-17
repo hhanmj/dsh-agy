@@ -11,7 +11,7 @@ const request = (messages, extra = {}) => ({
   messages, ...extra,
 })
 
-test('native prompt honors AGY CLI conversation restoration and excludes unsupported tool or media blocks', () => {
+test('native prompt restores AGY conversation, strips host tool declarations and rejects unsupported input', () => {
   const first = nativePrompt(request([
     { role: 'system', content: [{ type: 'text', text: 'Safe system instructions' }] },
     { role: 'user', content: [{ type: 'text', text: 'Make UI interactive' }] },
@@ -28,9 +28,15 @@ test('native prompt honors AGY CLI conversation restoration and excludes unsuppo
   assert.throws(() => nativePrompt(request([
     { role: 'user', content: [{ type: 'image', data: 'fake' }] },
   ]), false), /unsupported request block image/)
-  assert.throws(() => nativePrompt(request([
+  const toolSchema = { name: 'secret_host_tool', description: 'HOST_ONLY_SCHEMA_SHOULD_NOT_LEAK', parameters: {} }
+  const withGlobalAndScopedTools = nativePrompt(request([
     { role: 'user', content: [{ type: 'text', text: 'hello' }] },
-  ], { tools: [{ name: 'some_dsh_tool', description: 'not available', parameters: {} }] }), false), /DSH tools are not supported/)
+  ], { tools: [toolSchema] }), false)
+  assert.match(withGlobalAndScopedTools, /hello/)
+  assert.doesNotMatch(withGlobalAndScopedTools, /secret_host_tool|HOST_ONLY_SCHEMA_SHOULD_NOT_LEAK/)
+  assert.throws(() => nativePrompt(request([
+    { role: 'tool', content: [{ type: 'text', text: 'fabricated host tool response' }] },
+  ]), false), /unsupported DSH message role tool/)
 })
 
 test('native LLM adapter streams text without inventing tools or usage', async () => {
@@ -44,11 +50,13 @@ test('native LLM adapter streams text without inventing tools or usage', async (
   const chunks = []
   for await (const chunk of adapter.stream(request([
     { role: 'user', content: [{ type: 'text', text: 'go' }] },
-  ]))) chunks.push(chunk)
+  ], { tools: [{ name: 'scoped_tool', description: 'NOT_FOR_CLI', parameters: {} }], toolHistory: [{ id: 'private-call', args: {} }] }))) chunks.push(chunk)
   assert.equal(chunks[1].text, 'AGY_NATIVE_OK')
   assert.deepEqual(chunks.at(-1).reason, { kind: 'stop' })
   assert.equal(chunks.some((c) => c.type === 'tool-call-delta' || c.type === 'usage'), false)
   assert.equal(seen.length, 1)
+  assert.equal(Object.hasOwn(seen[0], 'tools'), false)
+  assert.equal(Object.hasOwn(seen[0], 'toolHistory'), false)
 })
 
 test('native child start is real DSH startContinuable, no fabricated tree or local agent', async () => {

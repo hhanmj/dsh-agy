@@ -4,7 +4,9 @@
  * acquires a DSH Agent, tool registry, or Session write capability.
  *
  * Supports plain text requests only; AGY uses its own CLI-internal tools.
- * DSH child tools must be filtered away at native child creation.
+ * Native child creation restricts global tools, but per-child scoped tools
+ * may still be advertised by DSH. The adapter strips model-facing tool
+ * schemas/history at its own boundary. It never emits DSH tool calls.
  */
 import { LlmAdapter, type GenerateOptions, type LlmModelInfo, type LlmProviderInfo, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm'
 
@@ -30,11 +32,16 @@ function asText(content: unknown): string {
 
 /** Full first turn; only the latest user delivery for AGY CLI --conversation. */
 export function nativePrompt(options: GenerateOptions, resume: boolean): string {
-  if (options.tools?.length) {
-    throw new Error('AGY native bridge: DSH tools are not supported; native child toolFilter must be { allow: [] }')
+  // A child's scoped tools can survive ctx.tools.restrict({ allow: [] });
+  // schema advertisement is not permission or evidence that AGY can call them.
+  // options.tools is never included in the CLI prompt. DSH tool messages,
+  // however, must fail closed rather than silently disappear from history.
+  for (const message of options.messages) {
+    if (message.role !== 'user' && message.role !== 'assistant' && message.role !== 'system') {
+      throw new Error(`AGY native bridge: unsupported DSH message role ${String(message.role)} (text-only transport)`)
+    }
   }
   const items = options.messages
-    .filter((message) => message.role === 'user' || message.role === 'assistant' || message.role === 'system')
     .map((message) => ({ role: message.role, body: asText(message.content) }))
     .filter(({ body }) => body.trim().length > 0)
   if (resume) {
@@ -88,7 +95,11 @@ export class NativeAgyLlmAdapter extends LlmAdapter {
     if (options.signal?.aborted) throw new Error('AGY native bridge: request aborted')
     // Use the persisted conversation index as the source of resume state,
     // not heuristics based on the DSH request message count.
-    const text = await this.runner(options)
+    // Never expose DSH tool declarations or tool histories to the AGY
+    // subprocess runner, even when scoped child tools survive the allow-list.
+    // Only text messages/system information can cross this transport boundary.
+    const { tools: _hostTools, toolHistory: _hostToolHistory, ...safeOptions } = options
+    const text = await this.runner(safeOptions)
     if (options.signal?.aborted) throw new Error('AGY native bridge: request aborted')
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'text-delta', index: 0, text }

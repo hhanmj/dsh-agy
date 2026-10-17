@@ -24,6 +24,19 @@ dsh plugin --profile web add ".\deploy\dsh-subagent-agy-reviewed"
 
 **For DSH Desktop/Tauri install from the persistent directory, not a local `.tgz` file.** We observed its startup recovery report `INTERNAL_PLUGIN_DANGLING_LINK_UNINSTALLING` and remove a plugin registered via `file:...tgz`, along with its Profile config. The staged directory contains only packaged source output, is gitignored, and remains in place for the next start. Install using the profile actually started by your host, and restart the backend. This directory workaround still needs a restart test on the target Desktop. Avoid concurrent plugin-manager writes.
 
+### v0.4.1 hotfix for scoped child-tool advertisements
+
+DSH `toolFilter: { allow: [] }` masks global tools but may leave child-local tool registrations visible. This bridge now strips tool schemas and tool history before the AGY CLI invocation, while rejecting actual tool-role messages and non-text content. It never pretends to invoke host DSH tools.
+
+To stage a fixed build without overwriting a live Junction target (still version 0.4.1):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "F:\agy-subagebt\scripts\stage-local-install.ps1" -StageName dsh-subagent-agy-reviewed-hotfix
+dsh plugin --profile web add "F:\agy-subagebt\deploy\dsh-subagent-agy-reviewed-hotfix"
+```
+
+Wait for any active jobs, restart the DSH backend, and test with a fresh native child, not the failed child session.
+
 ## Experimental native child sessions
 
 The staged v0.4.1 bundle configuration includes `nativeContinuableEnabled: true`; **no separate toggle is necessary for the directory installation**. For an already installed and intact plugin whose configuration lacks that setting, enable it with:

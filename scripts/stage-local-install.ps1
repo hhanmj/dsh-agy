@@ -9,11 +9,13 @@
   to the user, to avoid clobbering live plugin-manager operations.
 #>
 param(
-  [switch]$SkipBuild
+  [switch]$SkipBuild,
+  [ValidatePattern('^[A-Za-z0-9_.-]+$')]
+  [string]$StageName = 'dsh-subagent-agy-reviewed'
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$stage = Join-Path $root 'deploy\dsh-subagent-agy-reviewed'
+$stage = Join-Path (Join-Path $root 'deploy') $StageName
 $tmp = Join-Path $root ('deploy\.agy-stage-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 try {
@@ -52,6 +54,16 @@ try {
     throw 'Native preview is not enabled in the staged package'
   }
   if (Test-Path $stage) {
+    # Never replace the currently installed live junction target: Node can
+    # still be executing from this directory. Stage a distinct path instead.
+    $profilePackage = Join-Path (Join-Path $HOME '.dsh\profiles\web\node_modules\@dsh-external') 'dsh-subagent-agy-reviewed'
+    $installed = Get-Item $profilePackage -Force -ErrorAction SilentlyContinue
+    if ($installed -and $installed.Target) {
+      $linked = @($installed.Target)[0]
+      if ([string]::Equals(([System.IO.Path]::GetFullPath($linked)).TrimEnd('\'), ([System.IO.Path]::GetFullPath($stage)).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to replace the live installed plugin at $stage; use -StageName dsh-subagent-agy-reviewed-hotfix"
+      }
+    }
     # Preserve the old package in a backup directory instead of deleting it.
     $backup = $stage + '.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
     Move-Item $stage $backup
