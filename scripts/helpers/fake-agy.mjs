@@ -1,7 +1,11 @@
 /** Shared offline test doubles: a scripted agy process behind a fake ctx.subprocess seam. */
 import { PassThrough } from 'node:stream'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { apply, Config } from '../../lib/index.js'
+import { subprocess as nodeSubprocess } from './node-subprocess.mjs'
+
+const MOCK_STREAM = join(dirname(fileURLToPath(import.meta.url)), 'mock-agy-stream.mjs')
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -18,6 +22,8 @@ export function reader(get) {
 }
 
 export const HELP = '--add-dir  Add dir\n--conversation  Resume\n--dangerously-skip-permissions  x\n--output-format  Output format for print mode (text, json, stream-json)\n--print  Run a prompt\n--print-timeout  t\n--sandbox  s\n'
+/** agy 1.4.0 help additionally documents streaming input. */
+export const HELP_STREAM = HELP + '--input-format  Input format for print mode (text, stream-json). stream-json reads one NDJSON message per line from stdin\n'
 
 /** Scripted agy process: emits stdout chunks, then exits (or hangs until terminate). */
 export function scriptedHandle(spec, plan) {
@@ -71,12 +77,14 @@ function collectedHandle(stdout, exitCode = 0, stderr = '') {
 /**
  * Minimal Cordis-like ctx with a fake ctx.subprocess seam driving scripted agy runs.
  * options.models: "agy models" stdout, or { fail: 'message' } to simulate a failing listing.
+ * options.help: `agy help` text; options.streamMock: run --input-format argv against the real mock CLI.
  */
 export function harness(dir, plans, extraConfig = {}, options = {}) {
   const tools = new Map()
   const spawns = []
   const continuable = []
   const modelCalls = []
+  const streamSpawns = []
   let provider
   let adapter
   const agents = new Map()
@@ -95,7 +103,13 @@ export function harness(dir, plans, extraConfig = {}, options = {}) {
     subprocess: {
       async resolveExecutable() { return join(dir, 'agy.exe') },
       spawn(spec) {
-        if (spec.argv[1] === 'help') return collectedHandle(HELP)
+        if (spec.argv[1] === 'help') return collectedHandle(options.help ?? HELP)
+        if (options.streamMock && spec.argv.includes('--input-format')) {
+          // Real child process: the mock speaks the documented streaming protocol over stdin/stdout.
+          const handle = nodeSubprocess.spawn({ ...spec, argv: [process.execPath, MOCK_STREAM, ...spec.argv.slice(1)], env: {} })
+          streamSpawns.push({ spec, handle })
+          return handle
+        }
         if (spec.argv[1] === 'models') {
           modelCalls.push(spec)
           const models = options.models ?? MODELS
@@ -119,7 +133,7 @@ export function harness(dir, plans, extraConfig = {}, options = {}) {
     nativeRegistryPath: join(dir, 'native.json'), traceDir: join(dir, 'traces'), ...extraConfig,
   })
   apply(ctx, config)
-  return { ctx, tools, spawns, agents, config, continuable, modelCalls, get provider() { return provider }, get adapter() { return adapter } }
+  return { ctx, tools, spawns, agents, config, continuable, modelCalls, streamSpawns, get provider() { return provider }, get adapter() { return adapter } }
 }
 
 export const parentAgent = (dir, id = 'session-parent') => ({ id, session: { id, header: { cwd: dir } } })

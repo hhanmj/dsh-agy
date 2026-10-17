@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-subagent-agy-reviewed",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Delegate tasks to Google Antigravity CLI (agy) as a DSH subagent — no Gemini API key needed, uses your Antigravity login",
   "type": "module",
   "main": "./lib/index.js",
@@ -48,7 +48,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepack": "npm run build",
-    "test": "npm run build && node --test scripts/evidence.test.mjs scripts/plugin-smoke.test.mjs scripts/native-manager.test.mjs scripts/native-continuable.test.mjs scripts/stream-trace.test.mjs scripts/supervision.test.mjs scripts/models.test.mjs scripts/native-chat.test.mjs scripts/skills-bridge.test.mjs && node scripts/selftest.mjs",
+    "test": "npm run build && node --test scripts/evidence.test.mjs scripts/plugin-smoke.test.mjs scripts/native-manager.test.mjs scripts/native-continuable.test.mjs scripts/stream-trace.test.mjs scripts/supervision.test.mjs scripts/models.test.mjs scripts/native-chat.test.mjs scripts/skills-bridge.test.mjs scripts/activity.test.mjs scripts/persistent.test.mjs && node scripts/selftest.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "selftest": "node scripts/selftest.mjs",
     "selftest:e2e": "node scripts/selftest.mjs --e2e"

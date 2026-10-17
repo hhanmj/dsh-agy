@@ -76,7 +76,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId, type ContentBlock, type GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { createHash, randomUUID } from 'node:crypto'
-import { NativeAgyLlmAdapter, NATIVE_MODEL_ID, nativePrompt, type NativeTextSink } from './native-bridge.js'
+import { NativeAgyLlmAdapter, NATIVE_MODEL_ID, nativePrompt, reconcileFinalText, type NativeTextSink } from './native-bridge.js'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
@@ -95,7 +95,9 @@ import {
   type TraceSummary,
   type TraceTransport,
 } from './trace.js'
-import { prepareSupervisor, supervisionPromptNote, supervisorDirFor, type SupervisionReport, type SupervisorHandle } from './supervision.js'
+import { prepareSupervisor, sliceSupervisionReport, supervisionPromptNote, supervisorDirFor, type SupervisionReport, type SupervisorHandle } from './supervision.js'
+import { ActivityTracker, type AgyActivityEvent } from './activity.js'
+import { PersistentAgySessionManager, type PersistentAgyProcess, type PersistentTurnOutcome } from './persistent.js'
 import { AgyModelCatalog, AgyModelSelectionError, EFFORT_ORDER, defaultEffortFor, resolveSelection, type AgyBaseModel } from './models.js'
 import { fileURLToPath } from 'node:url'
 
@@ -285,8 +287,25 @@ export const Config = z.object({
   nativeDefaultEffort: z.string().default('high'),
   /** Ceiling for one native AGY turn (child or main chat): long coding turns run many AGY tool steps. */
   nativeTimeoutMs: z.number().step(1).min(60_000).max(6 * 3_600_000).default(3_600_000),
-  /** Show AGY's own tool steps as short progress lines in a MAIN chat (children report them only in the trace). */
+  /**
+   * EXPERIMENTAL: keep one long-lived agy process per DSH session and send each
+   * turn over stdin (agy --input-format stream-json). Off: one agy process per
+   * turn resumed with --conversation (the verified default). Falls back to that
+   * automatically when the agy build lacks streaming input.
+   */
+  nativePersistentSessions: z.boolean().default(false),
+  /** Close an idle persistent agy process after this many ms (0 = keep until the plugin stops). */
+  nativePersistentIdleMs: z.number().step(1).min(0).max(24 * 3_600_000).default(600_000),
+  /** Show AGY's own tool steps as short progress lines in a MAIN chat while it runs (children report them only in the trace). */
   nativeChatToolProgress: z.boolean().default(true),
+  /**
+   * When a main-chat turn ends, replace the live progress lines with one
+   * collapsible GenUI execution panel (a dsh-ui accordion; needs the dsh-genui
+   * plugin, otherwise it shows as a JSON code block).
+   */
+  nativeChatExecutionPanel: z.boolean().default(true),
+  /** Language of the execution panel labels. */
+  nativeChatPanelLanguage: z.union(['zh', 'en'] as const).default('zh'),
   /**
    * Context capacity advertised to DSH per base model id (tokens). agy reports
    * none; defaults are vendor model-card figures (as compiled by the MIT
@@ -387,6 +406,10 @@ export interface Config {
   nativeDefaultEffort: string
   nativeTimeoutMs: number
   nativeChatToolProgress: boolean
+  nativeChatExecutionPanel: boolean
+  nativePersistentSessions: boolean
+  nativePersistentIdleMs: number
+  nativeChatPanelLanguage: 'zh' | 'en'
   nativeContextWindows: Record<string, number>
   disposeGraceMs: number
   traceEnabled: boolean
@@ -707,6 +730,8 @@ interface AgyFlagSupport {
   addDir: boolean
   promptFile: boolean
   streamJson: boolean
+  /** --input-format stream-json (persistent stdin sessions). */
+  streamInput: boolean
   probed: boolean
 }
 
@@ -718,6 +743,8 @@ const UNKNOWN_FLAG_SUPPORT: AgyFlagSupport = {
   addDir: true,
   promptFile: false,
   streamJson: true,
+  // Never assumed: a persistent session needs a build that documents it.
+  streamInput: false,
   probed: false,
 }
 
@@ -732,6 +759,7 @@ function parseFlagSupport(text: string): AgyFlagSupport {
     promptFile: has('prompt-file'),
     // `stream-json` is a VALUE of `--output-format` (not a flag), so match the bare word.
     streamJson: /\bstream-json\b/.test(text),
+    streamInput: has('input-format') && /\bstream-json\b/.test(text),
     probed: has('print') || has('conversation'),
   }
 }
@@ -964,52 +992,101 @@ function agentIdOf(agent: unknown): string | null {
 
 /**
  * DSH token usage for one AGY turn from AGY's own numbers. A DSH request is one
- * AGY turn made of several model calls: the prompt side (uncached input +
- * cache reads) is the LAST call's, which is the conversation's current
- * context size (what DSH's context gauge shows); output and reasoning are the
- * turn totals (what was generated). Nothing is estimated: with no reported
- * usage, none is emitted.
+ * AGY turn made of several model calls. The prompt side (uncached input +
+ * cache reads) is the LAST call's, i.e. the conversation's current context
+ * size (what DSH's context gauge shows); output and reasoning are the sums of
+ * this turn's calls. result.usage is CUMULATIVE over the whole conversation on
+ * a --conversation resume and in a persistent session (verified on agy 1.4.0),
+ * so it is used only when no per-call usage arrived. Nothing is estimated.
  */
 class TurnUsage {
   private lastCall: { input_tokens?: number; cache_read_tokens?: number } | undefined
+  private stepOutput = 0
+  private stepThinking = 0
+  private sawStepUsage = false
   private total: { input_tokens?: number; output_tokens?: number; thinking_tokens?: number; cache_read_tokens?: number } | undefined
 
   readonly observe = (event: AgyStreamEvent): void => {
-    if (event.kind === 'step' && event.stepType === 'agent_response' && event.usage !== undefined) this.lastCall = event.usage
+    if (event.kind === 'step' && event.stepType === 'agent_response' && event.usage !== undefined) {
+      this.lastCall = event.usage
+      this.sawStepUsage = true
+      this.stepOutput += event.usage.output_tokens ?? 0
+      this.stepThinking += event.usage.thinking_tokens ?? 0
+    }
     if (event.kind === 'result' && event.usage !== undefined) this.total = event.usage
   }
 
   toDsh(): { usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; reasoningTokens?: number } } {
     const prompt = this.lastCall ?? this.total
-    const output = this.total?.output_tokens
+    const output = this.sawStepUsage ? this.stepOutput : this.total?.output_tokens
+    const reasoning = this.sawStepUsage ? this.stepThinking : this.total?.thinking_tokens
     if (prompt?.input_tokens === undefined || output === undefined) return {}
     return {
       usage: {
         inputTokens: prompt.input_tokens,
         outputTokens: output,
         ...(prompt.cache_read_tokens !== undefined ? { cacheReadTokens: prompt.cache_read_tokens } : {}),
-        ...(this.total?.thinking_tokens !== undefined ? { reasoningTokens: this.total.thinking_tokens } : {}),
+        ...(reasoning !== undefined ? { reasoningTokens: reasoning } : {}),
       },
     }
   }
 }
 
-/** One short, redacted line per finished AGY tool step for a main chat (not a DSH tool call). */
-function chatProgressLine(event: AgyStreamEvent): string | undefined {
-  if (event.kind !== 'step' || (event.stepType !== 'tool' && event.toolInfo === undefined)) return undefined
-  const state = event.state ?? ''
-  if (state !== 'DONE' && state !== 'ERROR') return undefined
-  const tool = event.toolName ?? event.toolInfo?.name ?? 'tool'
-  const params = event.toolInfo?.parameters as Record<string, unknown> | undefined
-  const subject = typeof params?.CommandLine === 'string' ? params.CommandLine
-    : typeof params?.TargetFile === 'string' ? params.TargetFile
-    : typeof params?.AbsolutePath === 'string' ? params.AbsolutePath : ''
-  const detail = subject ? ' ' + sanitizeText(subject, { home: homeDirectory() }, 120).replace(/\s+/g, ' ') : ''
-  const failed = state === 'ERROR' || (event.toolInfo?.error !== undefined && event.toolInfo.error !== null)
-  const seconds = event.durationSeconds !== undefined ? ' (' + event.durationSeconds.toFixed(1) + 's)' : ''
-  // Blank lines on both sides: a Markdown blockquote otherwise swallows the following text.
-  return '\n\n> AGY · ' + tool + detail + (failed ? ' — failed' : ' — done') + seconds + '\n\n'
+/** Workspace of a DSH session, for shortening paths in display text. */
+function cwdForDisplay(agent: { session: { header: { cwd?: string } } }): string | undefined {
+  return agent.session.header.cwd
 }
+
+/**
+ * The tool activity of one main-chat turn (from the unified activity model),
+ * rendered as ONE collapsible GenUI accordion (dsh-ui fence). Only recorded
+ * AGY data: tool, subject, state, duration, a redacted output/error preview,
+ * plus AGY's thinking-token count (the thinking itself is not exposed).
+ * JSON.stringify keeps the fence body on one line, so no inner line can close
+ * the Markdown fence.
+ */
+function executionPanelFence(activity: ActivityTracker, language: 'zh' | 'en', elapsedMs: number): string {
+  const zh = language === 'zh'
+  const all = activity.tools()
+  const failed = all.filter((step) => step.state === 'failed').length
+  const unfinished = all.filter((step) => step.state === 'running').length
+  const shown = all.slice(-80)
+  const seconds = Math.round(elapsedMs / 1000)
+  const thinking = activity.thinkingTokens
+  const title = zh
+    ? 'AGY 执行过程 · ' + all.length + ' 个工具步骤' + (failed > 0 ? ' · ' + failed + ' 个失败' : '') + (unfinished > 0 ? ' · ' + unfinished + ' 个未完成' : '') + ' · ' + seconds + 's' + (thinking > 0 ? ' · 思考 ' + thinking + ' tokens' : '')
+    : 'AGY execution · ' + all.length + ' tool step' + (all.length === 1 ? '' : 's') + (failed > 0 ? ' · ' + failed + ' failed' : '') + (unfinished > 0 ? ' · ' + unfinished + ' unfinished' : '') + ' · ' + seconds + 's' + (thinking > 0 ? ' · thinking ' + thinking + ' tokens' : '')
+  const noFence = (text: string): string => text.replace(/`{3,}/g, "'''")
+  const label = (state: string): string => state === 'failed' ? (zh ? '失败' : 'failed') : state === 'running' ? (zh ? '未完成' : 'unfinished') : (zh ? '完成' : 'done')
+  const items: Record<string, unknown>[] = []
+  if (shown.length < all.length) {
+    items.push({ type: 'text', size: 'caption', content: zh ? '前 ' + (all.length - shown.length) + ' 个步骤已省略' : (all.length - shown.length) + ' earlier steps omitted' })
+  }
+  items.push({
+    type: 'timeline',
+    items: shown.map((step) => ({
+      title: noFence((step.toolName ?? 'tool') + (step.summary ? ' · ' + step.summary : '')),
+      desc: noFence(label(step.state) + (step.detail ? ' — ' + step.detail : '')),
+      time: step.durationMs !== undefined ? (step.durationMs / 1000).toFixed(1) + 's' : '',
+    })),
+  })
+  items.push({ type: 'text', size: 'caption', content: zh ? '完整记录：antigravity_trace（id = 会话 id）' : 'Full record: antigravity_trace (id = session id)' })
+  const spec = { items: [{ type: 'accordion', items: [{ title, items }] }] }
+  return '```dsh-ui\n' + JSON.stringify(spec) + '\n```'
+}
+
+/**
+ * Live main-chat line for a tool activity whose state changed: started,
+ * finished or failed (an AGY step, never a DSH tool call). Blank lines on both
+ * sides: a Markdown blockquote otherwise swallows the following text.
+ */
+function activityProgressLine(step: AgyActivityEvent): string {
+  const subject = step.summary ? ' ' + step.summary.slice(0, 120) : ''
+  const seconds = step.durationMs !== undefined ? ' (' + (step.durationMs / 1000).toFixed(1) + 's)' : ''
+  const state = step.state === 'running' ? ' — running' : step.state === 'failed' ? ' — failed' + seconds : ' — done' + seconds
+  return '\n\n> AGY · ' + (step.toolName ?? 'tool') + subject + state + '\n\n'
+}
+
 
 /** Compact one-line progress marker for the background job_output stream. */
 function progressMarker(event: AgyStreamEvent): string {
@@ -1052,6 +1129,15 @@ interface SpawnPlan {
   selection: { model?: string; effort?: string; source: 'explicit' | 'plugin-default' | 'cli-default' }
   /** DSH skills exposed to this run through the skills.json bridge. */
   sharedSkills: string[]
+  /** Notes appended to every prompt (browser/large-read/supervision); persistent turns append them per stdin line. */
+  promptSuffix: string
+}
+
+/** What the native runner needs from one AGY turn, one-shot or persistent. */
+interface NativeTurnRun {
+  id: SessionId
+  result: Promise<SubagentResult>
+  dispose(): Promise<void>
 }
 
 /** Compiled supervisor hook text, read once from lib/. */
@@ -1380,7 +1466,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
     cwdOverride: string | undefined,
     dirs: readonly string[],
     timeoutMs: number,
-    options: { cwd?: string; model?: string; effort?: string } = {},
+    options: { cwd?: string; model?: string; effort?: string; persistent?: boolean } = {},
   ): Promise<SpawnPlan> {
     const { ctx, config } = this
     const addDirs = validateAddDirs(PREFIX, dirs, 'config/tool')
@@ -1393,6 +1479,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
     let effectivePrompt = promptText
     if (config.avoidBrowser) effectivePrompt += AVOID_BROWSER_SUFFIX
     if (config.avoidLargeReads) effectivePrompt += AVOID_LARGE_READ_SUFFIX
+    const persistent = options.persistent === true
 
     const support = await this.probeFlags(exe, env, childCwd)
     const id = `${request.parent.session.id}::agy::${this.nextRunId()}` as unknown as SessionId
@@ -1434,7 +1521,11 @@ class AntigravitySubagentProvider implements SubagentProvider {
     // automatically and the prompt is handed over via a temp file instead.
     let promptFilePath: string | undefined
     let promptArgv: string[]
-    if (effectivePrompt.length > MAX_ARGV_PROMPT_CHARS) {
+    if (persistent) {
+      // Prompts go over stdin, one line per turn; -p would be ignored in this mode.
+      if (!support.streamInput) throw new Error(`${PREFIX}: this agy build does not support --input-format stream-json`)
+      promptArgv = ['--input-format', 'stream-json', '--output-format', 'stream-json']
+    } else if (effectivePrompt.length > MAX_ARGV_PROMPT_CHARS) {
       if (!support.promptFile) {
         throw new Error(
           `${PREFIX}: prompt is ${effectivePrompt.length} chars, exceeding the ${MAX_ARGV_PROMPT_CHARS}-char argv limit, and this agy build does not support --prompt-file. Split the task into smaller steps, or write the bulky context into files in the workspace and reference them from a short prompt.`,
@@ -1452,12 +1543,9 @@ class AntigravitySubagentProvider implements SubagentProvider {
       promptArgv = ['-p', effectivePrompt]
     }
 
-    const baseArgv: string[] = [
-      exe,
-      ...promptArgv,
-      '--print-timeout',
-      `${Math.max(1, Math.round(timeoutMs / 1000))}s`,
-    ]
+    const baseArgv: string[] = persistent
+      ? [exe, ...promptArgv]
+      : [exe, ...promptArgv, '--print-timeout', `${Math.max(1, Math.round(timeoutMs / 1000))}s`]
     let effectiveModel = (options.model ?? config.model).trim()
     let effectiveEffort = (options.effort ?? config.effort).trim().toLowerCase()
     if (effectiveModel.length > 0) {
@@ -1566,6 +1654,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
       ...(supervisor !== undefined ? { supervisor } : {}),
       selection,
       sharedSkills: shared?.names ?? [],
+      promptSuffix: effectivePrompt.slice(promptText.length),
     }
   }
 
@@ -1714,6 +1803,183 @@ class AntigravitySubagentProvider implements SubagentProvider {
         throw error
       },
     )
+  }
+
+  /** Persistent agy processes keyed by DSH session (opt-in: nativePersistentSessions); created on first use. */
+  private persistentManager: PersistentAgySessionManager | undefined
+  get persistent(): PersistentAgySessionManager {
+    return this.persistentManager ??= this.createPersistentManager()
+  }
+
+  private createPersistentManager(): PersistentAgySessionManager {
+    return new PersistentAgySessionManager({
+    spawn: (spec) => this.ctx.subprocess.spawn({
+      argv: spec.argv,
+      cwd: spec.cwd,
+      env: spec.env,
+      // stdin stays open for the next turn; the process outlives any single request.
+      stdio: { stdin: 'pipe', stdout: 'pipe', stderr: { maxBytes: MAX_STDERR_BYTES } },
+      graceMs: this.config.disposeGraceMs,
+    }),
+    idleMs: this.config.nativePersistentIdleMs,
+    graceMs: this.config.disposeGraceMs,
+  })
+  }
+
+  /** Live persistent sessions (pid, state, turns, conversation) for diagnostics. */
+  persistentSessions(): ReturnType<PersistentAgySessionManager['list']> {
+    return this.persistentManager?.list() ?? []
+  }
+
+  /** Stop every persistent agy process (plugin teardown). */
+  async disposePersistent(): Promise<void> {
+    await this.persistentManager?.dispose()
+  }
+  /** Spawn plan (supervisor, selection, prompt notes) of every live persistent process. */
+  private readonly persistentPlans = new WeakMap<PersistentAgyProcess, { plan: SpawnPlan; seenDecisions: number }>()
+  private streamInputWarned = false
+
+  /** Whether this agy build supports persistent stdin sessions (one-time help probe). */
+  async supportsStreamInput(parent: { session: { header: { cwd?: string } } }): Promise<boolean> {
+    const env = { ...scrubbedParentEnv(), ...this.config.env }
+    applyProxyEnv(env, resolveProxyUrl(this.config))
+    try {
+      const exe = await this.resolveCommandPath(env, new AbortController().signal)
+      const support = await this.probeFlags(exe, env, parent.session.header.cwd ?? process.cwd())
+      if (!support.streamInput && !this.streamInputWarned) {
+        this.streamInputWarned = true
+        this.ctx.logger.warn(`${PREFIX}: nativePersistentSessions is on but this agy build does not document --input-format stream-json; using one process per turn`)
+      }
+      return support.streamInput
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * One turn on the session's persistent agy process (started, or restarted
+   * with --conversation, when needed). Each turn is its own trace run and
+   * task record; per-turn supervision decisions are sliced from the process's
+   * supervisor log. Cancelling kills the process: an unfinished turn is never
+   * reported as completed nor assumed to be resumable.
+   */
+  async runPersistent(
+    startRequest: SubagentStartRequest,
+    options: { sessionKey: string; conversationId?: string; cwd: string; dirs: string[]; timeoutMs: number; stream: AgyRunStreamOptions; model?: string; effort?: string },
+  ): Promise<NativeTurnRun> {
+    const { ctx, config } = this
+    const request = startRequest as ResolvedSubagentStartRequest
+    const observe = options.stream
+    const promptText = textOfPrompt(request.prompt)
+    if (promptText.trim().length === 0) throw new Error(`${PREFIX}: request prompt contains no text`)
+    // Everything that is a process START option; a change restarts the process (with --conversation).
+    const key = JSON.stringify({
+      model: options.model ?? config.model, effort: options.effort ?? config.effort, cwd: options.cwd, dirs: [...options.dirs].sort(),
+      supervision: config.supervisionEnabled, skip: config.skipPermissions, sandbox: config.sandbox, agent: config.agent,
+      extra: config.extraArgs, skills: config.sharedSkills, env: config.env,
+    })
+    const traceKey = observe.traceKey ?? options.sessionKey
+    let recorder: RunTraceRecorder | undefined
+    let runId = `${options.sessionKey}#pending` as unknown as SessionId
+    let turnProcess: PersistentAgyProcess | undefined
+    let turnPlan: { plan: SpawnPlan; seenDecisions: number } | undefined
+    let spawnedPlan: SpawnPlan | undefined
+    const onEvent = (event: AgyStreamEvent): void => {
+      recorder?.onEvent(event)
+      try {
+        observe.onEvent?.(event)
+      } catch (error) {
+        ctx.logger.warn(`${PREFIX}: stream event consumer failed: ${String(error)}`)
+      }
+      if (event.kind === 'step' && event.textDelta !== undefined && event.textDelta.length > 0) {
+        try {
+          observe.onText?.(event.textDelta)
+        } catch (error) {
+          ctx.logger.warn(`${PREFIX}: live text consumer failed: ${String(error)}`)
+        }
+      }
+    }
+    const buildSpawn = async () => {
+      const plan = await this.spawnPlan(request, options.conversationId, options.cwd, options.dirs, options.timeoutMs, {
+        cwd: options.cwd,
+        ...(options.model !== undefined ? { model: options.model } : {}),
+        ...(options.effort !== undefined ? { effort: options.effort } : {}),
+        persistent: true,
+      })
+      spawnedPlan = plan
+      const argv = [...plan.baseArgv, ...(options.conversationId !== undefined ? ['--conversation', options.conversationId] : [])]
+      return { spec: { argv, cwd: plan.childCwd, env: plan.env }, onClosed: () => plan.supervisor?.dispose() }
+    }
+    const onProcess = (process: PersistentAgyProcess, startedNow: boolean): void => {
+      turnProcess = process
+      if (startedNow && spawnedPlan !== undefined) this.persistentPlans.set(process, { plan: spawnedPlan, seenDecisions: 0 })
+      turnPlan = this.persistentPlans.get(process)
+      const plan = turnPlan?.plan
+      runId = `${plan?.id ?? options.sessionKey}#${process.turns + 1}` as unknown as SessionId
+      recorder = this.createRecorder(traceKey, runId as unknown as string, plan?.childCwd ?? options.cwd, request.parent, observe)
+      const conversation = process.conversationId ?? options.conversationId
+      recorder?.start({
+        mode: observe.mode ?? 'native-persistent',
+        label: plan?.label ?? request.label ?? 'antigravity task',
+        resumed: !startedNow || options.conversationId !== undefined,
+        ...(conversation !== undefined ? { conversation_id: conversation } : {}),
+        transport: 'stream-json',
+        supervision: plan?.supervisor !== undefined ? 'enforced' : 'off',
+        model: plan?.selection.model ?? null,
+        effort: plan?.selection.effort ?? null,
+        model_source: plan?.selection.source ?? 'cli-default',
+        ...(plan !== undefined && plan.sharedSkills.length > 0 ? { shared_skills: plan.sharedSkills } : {}),
+        process: { ...(process.pid !== undefined ? { pid: process.pid } : {}), turn: process.turns + 1, reused: !startedNow },
+      })
+    }
+    const settled = this.persistent.runTurn(
+      options.sessionKey, key, buildSpawn,
+      () => promptText + (turnPlan?.plan.promptSuffix ?? ''),
+      { onEvent, signal: request.signal, timeoutMs: options.timeoutMs },
+      onProcess,
+    ).then((outcome): SubagentResult => {
+      const plan = turnPlan?.plan
+      // Per-turn slice of the process's supervisor log.
+      let supervision: SupervisionReport | undefined
+      if (plan?.supervisor !== undefined && turnPlan !== undefined) {
+        try {
+          const report = plan.supervisor.collect()
+          supervision = sliceSupervisionReport(report, turnPlan.seenDecisions)
+          turnPlan.seenDecisions = report.decisions.length
+        } catch {
+          supervision = undefined
+        }
+      }
+      const conversation = outcome.conversationId ?? turnProcess?.conversationId
+      this.remember(runId as unknown as string, conversation, plan?.childCwd ?? options.cwd, plan?.label ?? request.label ?? 'antigravity task', plan?.selection ?? {})
+      const detail = outcome.status === 'completed' ? undefined
+        : this.maybeAutoLogin([outcome.error, outcome.stderrTail?.trim()].filter((part) => part !== undefined && part.length > 0).join('\n') || `AGY turn ended with ${outcome.status}`)
+      recorder?.end({
+        outcome: outcome.status === 'completed' ? 'completed' : outcome.status === 'cancelled' ? 'cancelled' : outcome.status === 'timeout' ? 'timeout' : 'failed',
+        exit_code: outcome.exitCode ?? null,
+        signal: null,
+        timed_out: outcome.status === 'timeout',
+        cancelled: outcome.status === 'cancelled',
+        stderr: outcome.stderrTail ?? '',
+        agy_error: parseAgyErrorLine(outcome.stderrTail ?? ''),
+        ...(detail !== undefined ? { diagnostic: detail.slice(0, 1000) } : {}),
+        ...(supervision !== undefined ? { supervision } : {}),
+      })
+      if (supervision !== undefined) recorder?.supervision(supervision)
+      if (outcome.status === 'completed') return { output: textBlocks(outcome.response), stopReason: 'completed' }
+      if (outcome.status === 'cancelled') return { output: textBlocks(outcome.text), stopReason: 'aborted' }
+      return { output: textBlocks(detail ?? ''), stopReason: 'error', diagnostic: detail }
+    })
+    this.trackActive(runId as unknown as string, {
+      label: request.label ?? 'antigravity task',
+      cwd: options.cwd,
+      startedAt: Date.now(),
+      background: false,
+      cancel: () => turnProcess?.kill(),
+      traceKey,
+    }, settled)
+    // The process belongs to the session, not to this turn: dispose never kills it.
+    return { get id() { return runId }, result: settled, dispose: async () => {} }
   }
 
   private async runOnce(
@@ -2354,6 +2620,13 @@ export function apply(ctx: Context, config: Config): void {
     () => ctx.subagents.registerProvider(provider),
     `${PREFIX}: provider ${config.providerName}`,
   )
+  // Persistent agy processes never outlive the plugin (stop/update/unload).
+  ctx.effect(
+    () => () => {
+      void provider.disposePersistent().catch((error: unknown) => ctx.logger.warn(`${PREFIX}: persistent session shutdown failed: ${String(error)}`))
+    },
+    `${PREFIX}: persistent agy sessions`,
+  )
 
   if (config.nativeContinuableEnabled) {
     // DSH Session identity is the authoritative continuation key; AGY conversation
@@ -2398,6 +2671,12 @@ export function apply(ctx: Context, config: Config): void {
      * store into a per-session temp directory (passed with --add-dir) and refer
      * to its path, so AGY opens it with its own viewer (verified on 1.4.0).
      */
+    /** Per-session image folder (stable, so a persistent process keeps one --add-dir set). */
+    const sessionImageDir = (sessionId: string): string => {
+      const root = join(tmpdir(), 'dsh-agy-images')
+      pruneOldDirectories(root, 7 * 24 * 60 * 60 * 1000)
+      return join(root, createHash('sha256').update(sessionId).digest('hex').slice(0, 24))
+    }
     const saveImages = async (messages: GenerateOptions['messages'], sessionId: string, signal: AbortSignal | undefined): Promise<{ dir?: string; paths: Map<string, string> }> => {
       const paths = new Map<string, string>()
       const blocks: { attachment: { attachmentId: string; mediaType: string } }[] = []
@@ -2415,9 +2694,7 @@ export function apply(ctx: Context, config: Config): void {
         | { readImage(ref: unknown, signal?: AbortSignal): Promise<{ data: Uint8Array }> }
         | undefined
       if (store === undefined || typeof store.readImage !== 'function') return { paths }
-      const root = join(tmpdir(), 'dsh-agy-images')
-      pruneOldDirectories(root, 7 * 24 * 60 * 60 * 1000)
-      const dir = join(root, createHash('sha256').update(sessionId).digest('hex').slice(0, 24))
+      const dir = sessionImageDir(sessionId)
       mkdirSync(dir, { recursive: true })
       for (const block of blocks) {
         const id = block.attachment.attachmentId
@@ -2462,14 +2739,33 @@ export function apply(ctx: Context, config: Config): void {
       const onText = sink !== undefined ? { onText: (delta: string) => sink.text(delta) } : {}
       // AGY reports usage per model call; a DSH request is one AGY turn.
       const usage = new TurnUsage()
+      // Unified activity model: one record per AGY step (ACTIVE/DONE/ERROR fold into it).
+      const displayCwd = cwdForDisplay(child)
+      const activity = new ActivityTracker({
+        sessionId: childId, runId: 'turn', traceRef: childId,
+        sanitize: { home: homeDirectory(), ...(displayCwd !== undefined ? { cwd: displayCwd } : {}) },
+      })
       const progress = !isChild && config.nativeChatToolProgress && sink !== undefined
+      const showPanel = !isChild && config.nativeChatExecutionPanel
+      const announced = new Map<number, string>()
+      let agyText = ''
       const onEvent = (event: AgyStreamEvent): void => {
         usage.observe(event)
-        if (progress) {
-          const line = chatProgressLine(event)
-          if (line !== undefined) sink.text(line)
+        const step = activity.observe(event)
+        if (event.kind === 'step' && event.textDelta !== undefined) agyText += event.textDelta
+        // Live: a tool step's start, finish and failure (each state once).
+        if (progress && step?.type === 'tool' && announced.get(step.stepIndex) !== step.state) {
+          announced.set(step.stepIndex, step.state)
+          sink.text(activityProgressLine(step))
         }
       }
+      /** Main chat: AGY's own text plus one collapsible panel instead of the live progress lines. */
+      const finalDisplay = (finalText: string): { display?: string } => {
+        if (!showPanel || activity.tools().length === 0) return {}
+        const text = agyText + reconcileFinalText(agyText, finalText)
+        return { display: text.replace(/\s+$/, '') + '\n\n' + executionPanelFence(activity, config.nativeChatPanelLanguage, Date.now() - turnStartedAt) + '\n' }
+      }
+      const turnStartedAt = Date.now()
       const timeoutMs = config.nativeTimeoutMs
 
       // DSH auxiliary calls (session titles, compaction) share the session id but
@@ -2496,6 +2792,17 @@ export function apply(ctx: Context, config: Config): void {
       const previous = loadTaskRegistry(nativeIndexConfig, ctx.logger)[childId]
       const cwd = previous?.cwd ?? resolveChildCwd(PREFIX, configuredCwd, child.session.header.cwd)
       const prompt = nativePrompt(options, previous !== undefined, { mode: isChild ? 'strict' : 'lenient', image })
+      // Opt-in persistent process (stdin stream-json); one-shot remains the fallback.
+      // A message starting with "/" would be taken as a CLI slash command, which ends a
+      // streaming session (agy docs); such a turn runs one-shot instead.
+      const persistent = config.nativePersistentSessions && !prompt.trimStart().startsWith('/') && await provider.supportsStreamInput(child)
+      let runDirs = dirs
+      if (persistent && config.nativeImageInput) {
+        // A stable image folder keeps the process key (and so the process) unchanged when images appear later.
+        const folder = sessionImageDir(childId)
+        mkdirSync(folder, { recursive: true })
+        runDirs = [folder]
+      }
       const request = {
         label: isChild ? 'AGY native child transport' : 'AGY native chat transport',
         parent: child,
@@ -2510,7 +2817,7 @@ export function apply(ctx: Context, config: Config): void {
         traceKind: isChild ? 'native' : 'chat',
         childId,
         owner,
-        mode: `${isChild ? 'native' : 'native-chat'}-${previous ? 'followup' : 'first'}`,
+        mode: `${isChild ? 'native' : 'native-chat'}${persistent ? '-persistent' : ''}-${previous ? 'followup' : 'first'}`,
         ...onText,
         onEvent,
       }
@@ -2520,9 +2827,11 @@ export function apply(ctx: Context, config: Config): void {
       } catch (error) {
         ctx.logger.warn(`${PREFIX}: native evidence baseline failed: ${String(error)}`)
       }
-      const run = previous
-        ? await provider.followup(request, previous.conversationId, cwd, { stream, dirs, timeoutMs, ...cli })
-        : await provider.startWithDirs(request, dirs, { cwd, stream, timeoutMs, ...cli })
+      const run: NativeTurnRun = persistent
+        ? await provider.runPersistent(request, { sessionKey: childId, ...(previous !== undefined ? { conversationId: previous.conversationId } : {}), cwd, dirs: runDirs, timeoutMs, stream, ...cli })
+        : previous
+          ? await provider.followup(request, previous.conversationId, cwd, { stream, dirs, timeoutMs, ...cli })
+          : await provider.startWithDirs(request, dirs, { cwd, stream, timeoutMs, ...cli })
       try {
         const result = await run.result
         if (before !== undefined) {
@@ -2554,7 +2863,8 @@ export function apply(ctx: Context, config: Config): void {
             createdAt: previous?.createdAt ?? Date.now(),
           }
         }, ctx.logger)
-        return { text: result.output.filter((block) => block.type === 'text').map((block) => block.text).join(''), ...usage.toDsh() }
+        const finalText = result.output.filter((block) => block.type === 'text').map((block) => block.text).join('')
+        return { text: finalText, ...usage.toDsh(), ...finalDisplay(finalText) }
       } finally {
         await run.dispose()
       }
@@ -3121,10 +3431,15 @@ export function apply(ctx: Context, config: Config): void {
                     },
                   },
                 },
+                persistent: { type: 'array', items: { type: 'json' } },
               },
             },
-            render: (_args: unknown, value: { running?: unknown[]; recent?: unknown[] }) => {
+            render: (_args: unknown, value: { running?: unknown[]; recent?: unknown[]; persistent?: unknown[] }) => {
               const lines: string[] = []
+              for (const entry of value.persistent ?? []) {
+                const item = entry as { sessionKey?: unknown; pid?: unknown; state?: unknown; turns?: unknown; conversationId?: unknown }
+                lines.push(`Persistent agy process: session ${String(item.sessionKey)} pid ${String(item.pid ?? '?')} ${String(item.state)} turns ${String(item.turns)} conversation ${String(item.conversationId ?? '?')}`)
+              }
               const running = value.running ?? []
               const recent = value.recent ?? []
               if (running.length === 0) {
@@ -3165,7 +3480,8 @@ export function apply(ctx: Context, config: Config): void {
               .sort((a, b) => b[1].createdAt - a[1].createdAt)
               .slice(0, limit)
               .map(([task, record]) => ({ task, label: record.label, cwd: record.cwd, createdAt: record.createdAt }))
-            return { running, recent }
+            const persistent = current.persistentSessions()
+            return { running, recent, ...(persistent.length > 0 ? { persistent: persistent as unknown as JsonValue[] } : {}) }
           },
         }),
       ),

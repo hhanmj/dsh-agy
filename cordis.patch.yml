@@ -1,4 +1,4 @@
-# Reviewed AGY subagent bundle entry. v0.4.1 enables the native preview for hands-on testing.
+# Reviewed AGY subagent bundle entry. v0.4.x enables the native preview for hands-on testing.
 # This flag is an explicit bundle setting; the source-code default remains false.
 # To disable for a profile, add config.nativeContinuableEnabled: false to its override.
 - insert:

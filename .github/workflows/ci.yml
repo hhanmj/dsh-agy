@@ -13,4 +13,4 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run build
-      - run: node --test scripts/evidence.test.mjs scripts/plugin-smoke.test.mjs scripts/native-manager.test.mjs scripts/native-continuable.test.mjs scripts/stream-trace.test.mjs scripts/supervision.test.mjs scripts/models.test.mjs scripts/native-chat.test.mjs scripts/skills-bridge.test.mjs
+      - run: node --test scripts/evidence.test.mjs scripts/plugin-smoke.test.mjs scripts/native-manager.test.mjs scripts/native-continuable.test.mjs scripts/stream-trace.test.mjs scripts/supervision.test.mjs scripts/models.test.mjs scripts/native-chat.test.mjs scripts/skills-bridge.test.mjs scripts/activity.test.mjs scripts/persistent.test.mjs

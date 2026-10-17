@@ -113,9 +113,51 @@ test('main chat: AGY tool steps appear as progress lines; DSH gets AGY-reported 
     assert.deepEqual(usage.usage, { inputTokens: 2321, outputTokens: 780, cacheReadTokens: 15612, reasoningTokens: 536 })
     assert.equal(chunks.at(-1).type, 'finish')
     assert.equal(flag(h.spawns[0].spec.argv, '--print-timeout'), '3600s')
+    // Settled message: AGY's own text + ONE collapsible GenUI panel instead of the live lines.
+    const final = chunks.find((c) => c.type === 'block-end').block.text
+    assert.doesNotMatch(final, /> AGY ·/)
+    const [before, fence] = final.split('```dsh-ui\n')
+    assert.match(before, /DONE\s*$/)
+    const body = fence.slice(0, fence.indexOf('\n```'))
+    assert.equal(body.includes('\n'), false, 'fence body stays on one line')
+    const spec = JSON.parse(body)
+    const section = spec.items[0].items[0]
+    assert.equal(spec.items[0].type, 'accordion')
+    assert.match(section.title, /^AGY 执行过程 · 4 个工具步骤 · 1 个失败 · \d+s · 思考 536 tokens$/)
+    const steps = section.items.find((n) => n.type === 'timeline').items
+    assert.deepEqual(steps.map((s) => s.title.split(' · ')[0]), ['run_command', 'view_file', 'write_to_file', 'view_file'])
+    assert.match(steps[2].title, /^write_to_file · (\S*[\\/])?note\.txt$/)
+    assert.match(steps[0].desc, /^完成 — hello-agy/)
+    assert.match(steps[1].desc, /^失败 — /)
+    assert.equal(steps[0].time, '0.4s')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('execution panel off: the settled message keeps the live progress lines', async () => {
+  const TOOLS = readFileSync(join(ROOT, 'scripts', 'fixtures', 'agy-1.4.0-tools.ndjson'), 'utf8')
+  const { dir, h, main } = setup('agy-chat-nopanel-', [{ chunks: [Buffer.from(TOOLS)] }], {}, { nativeChatExecutionPanel: false })
+  try {
+    const chunks = []
+    for await (const chunk of h.adapter.stream(req([{ role: 'user', content: text('go') }], { sessionId: main }))) chunks.push(chunk)
+    const streamed = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+    assert.equal(chunks.find((c) => c.type === 'block-end').block.text, streamed)
+    assert.doesNotMatch(streamed, /dsh-ui/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('lenient history drops earlier execution panels', () => {
+  const panel = '```dsh-ui\n{"items":[{"type":"accordion","items":[]}]}\n```'
+  const prompt = nativePrompt(req([
+    { role: 'user', content: text('first') },
+    { role: 'assistant', content: text('answer\n\n' + panel) },
+    { role: 'user', content: text('second') },
+  ]), false, { mode: 'lenient' })
+  assert.doesNotMatch(prompt, /accordion/)
+  assert.match(prompt, /answer\n\n\[AGY execution panel omitted\]/)
 })
 
 test('children keep tool steps out of their text (trace only) but still report usage', async () => {

@@ -2,7 +2,9 @@
 
 基于 [ZEM17/dsh-subagent-agy](https://github.com/ZEM17/dsh-subagent-agy) 开发，MIT 许可。通过已登录的 Antigravity CLI 委派实际 UI/UX 和代码任务，主模型负责独立验收。
 
-**当前版本：v0.4.1。** 已实测通过的 v0.4.0 前台任务、后台 Jobs、Better Sidebar 后台显示和会话恢复保持不变；新增 DSH 原生 Continuable 子会话桥接为**实验功能**，尚未完成真实 DSH 界面的端到端验证。v0.4.1 的发布包已显式开启预览模式。注意：DSH Desktop 某些版本启动时会错误地将通过本地 `.tgz` 安装的插件判为悬空链接并自动卸载；建议使用下述持久目录安装方式。
+**当前版本：v0.4.2。** 新增：统一的 AGY 执行活动模型（工具步骤开始/完成/失败实时显示，结束后收拢为可折叠面板）、**实验性常驻 CLI 会话**（`nativePersistentSessions`，默认关闭）、单轮 token 用量修正（续聊时 AGY 的 `result.usage` 为会话累计值，现改用本轮各次模型调用之和）。实现说明与验证见 [#2](https://github.com/hhanmj/dsh-agy/issues/2) 与 `docs/decisions/0001-v0.5.0-phase0.zh.md`。
+
+已实测通过的 v0.4.0 前台任务、后台 Jobs、Better Sidebar 后台显示和会话恢复保持不变；新增 DSH 原生 Continuable 子会话桥接为**实验功能**，尚未完成真实 DSH 界面的端到端验证。v0.4.1 的发布包已显式开启预览模式。注意：DSH Desktop 某些版本启动时会错误地将通过本地 `.tgz` 安装的插件判为悬空链接并自动卸载；建议使用下述持久目录安装方式。
 
 ## 安装
 
@@ -87,6 +89,23 @@ dsh plugin --profile web add "F:\agy-subagebt\deploy\dsh-subagent-agy-reviewed-h
 
 AGY 自身添加技能的方式：`~/.gemini/config/skills/<名称>/SKILL.md`（全局）、项目 `.agents/skills/<名称>/SKILL.md`、`~/.gemini/config/skills.json` 声明外部目录，或 `agy plugin install`；用 `agy -p "/skills" --output-format json` 查看（不耗额度）。
 
+### 可折叠的执行过程面板（GenUI）
+
+主对话运行中，每个 AGY 工具步骤的开始、完成、失败都会实时插入一行 `> AGY · … — running / done / failed`（来自统一执行活动模型：同一步骤的 ACTIVE/DONE/ERROR 合并为一条记录，参数与输出经脱敏截断，未知步骤类型保留原始标识）；本轮结束时，这些进度行被替换为**一个可折叠的「AGY 执行过程」面板**（`dsh-ui` 折叠面板 + 时间线：工具、对象、完成/失败、耗时、脱敏后的输出/错误摘要，最多显示最近 80 步），由 [dsh-genui](https://github.com/omdsh-dev/dsh-genui) 渲染（`nativeChatExecutionPanel`，默认开启；`nativeChatPanelLanguage`: zh/en）。面板只包含 AGY 自己记录的工具步骤；未安装 dsh-genui 时会显示为 JSON 代码块。之后发给 AGY 的历史会省略这些面板。GenUI 的 `panel:true` 侧栏只在消息结束后发布，无法在运行中实时更新，因此面板放在消息内。
+
+**为什么不是原生对话卡片：** DSH 0.2.0-rc.2 中，第三方插件写入新类型会话事件会使会话无法重新打开（`Session.append()` 不能标记 `ignorable`），上游插件规范也明确禁止；可持久化的插件记录 API 自 DSH 0.2.1-rc.2 才提供。因此在不升级 DSH 的前提下，采用“运行中进度行 + 结束后消息内折叠面板”作为等效界面（面板标题含 AGY 报告的思考 token 数，思考内容本身不可得）。
+
+### 实验性：常驻 AGY CLI 会话（`nativePersistentSessions`，默认关闭）
+
+开启后，每个使用 AGY 的 DSH 会话（主对话或原生子代理）保留一个 `agy --input-format stream-json --output-format stream-json` 进程，每轮通过 stdin 写入一行 `{"event":"user","message":{"content":"…"}}`，收到本轮 `result` 即完成，不再每轮重启 CLI。
+
+- **复用与重建**：模型、effort、工作目录、附加目录、监督与权限等启动参数不变时复用同一进程；任一变化时关闭旧进程，并用 `--conversation` 在新进程中继续同一对话。空闲 `nativePersistentIdleMs`（默认 10 分钟）后关闭；插件停止时全部终止。同一会话的请求串行，不同会话并发互不影响。
+- **取消**：协议没有“取消本轮”的消息，DSH 停止按钮会终止该进程；本轮记为已取消（绝不记为成功），下一轮用新进程从最后**完成**的一轮继续。超时、进程意外退出、缺少 `result` 均作为失败上报（附 stderr 摘要）。
+- **用量**：`num_turns`、`usage`、`duration_seconds` 是会话累计值；单轮用量取本轮各次模型调用的计数。
+- **回退**：`agy help` 未列出 `--input-format` 时自动使用每轮一个进程；以 `/` 开头的消息（会被 CLI 当作斜杠命令并结束会话）该轮自动改用一次性进程；DSH 的标题/压缩辅助请求仍为一次性调用。
+- **状态查看**：`antigravity_tasks` 列出常驻进程（PID、状态、轮数、conversation）；trace 中每轮记录 `process pid / turn / reused`。
+- **实测（真实 AGY 1.4.0，隔离目录）**：同一进程 5 轮、工具步骤实时显示、停止后新进程恢复对话；热进程续轮中位数 **2442 ms**，一次性续聊中位数 **6884 ms**（各 3 次，`node scripts/live-persistent-e2e.mjs`）。冷启动首轮另含 `agy help`/`agy models` 与进程启动（约 3–6 s）。DSH Desktop 内尚待实测。
+
 ### AGY 思考链
 
 AGY 1.4.0 不提供思考内容：stream-json 只有 `thinking_tokens` 计数，`PostInvocation` 钩子载荷也没有思考字段（已实测）。因此不显示、也不伪造思考链；主对话中的工具进度行与 `antigravity_trace` 是可见的真实执行过程。
@@ -138,7 +157,7 @@ AGY 的“完成”不代表验收成功。主模型需要自行检查 Git diff�
 
 ```powershell
 npm run build
-node --test scripts/evidence.test.mjs scripts/plugin-smoke.test.mjs scripts/native-manager.test.mjs scripts/native-continuable.test.mjs scripts/stream-trace.test.mjs scripts/supervision.test.mjs scripts/models.test.mjs scripts/native-chat.test.mjs scripts/skills-bridge.test.mjs
+node --test scripts/evidence.test.mjs scripts/plugin-smoke.test.mjs scripts/native-manager.test.mjs scripts/native-continuable.test.mjs scripts/stream-trace.test.mjs scripts/supervision.test.mjs scripts/models.test.mjs scripts/native-chat.test.mjs scripts/skills-bridge.test.mjs scripts/activity.test.mjs scripts/persistent.test.mjs
 ```
 
 全量 `npm test` 另外验证本地 AGY CLI 的存在及参数兼容性；真实 AGY 测试需主动运行 `npm run selftest:e2e`，或 `node scripts/live-trace-e2e.mjs`（消耗 AGY 额度，仅使用临时目录）。

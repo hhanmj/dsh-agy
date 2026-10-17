@@ -48,6 +48,20 @@ export interface SupervisionReport {
   effectiveModels: string[]
 }
 
+/** The part of a report produced after the first `from` decisions (one turn of a persistent process). */
+export function sliceSupervisionReport(report: SupervisionReport, from: number): SupervisionReport {
+  const decisions = report.decisions.slice(from)
+  const pre = decisions.filter((d) => d.event === 'PreToolUse')
+  return {
+    decisions,
+    allowed: pre.filter((d) => d.decision === 'allow').length,
+    denied: pre.filter((d) => d.decision !== 'allow').length,
+    reworks: decisions.filter((d) => d.event === 'Stop' && d.decision === 'continue').length,
+    tampered: report.tampered,
+    effectiveModels: [...new Set(decisions.map((d) => d.model).filter((m): m is string => typeof m === 'string' && m.length > 0))],
+  }
+}
+
 export interface SupervisorHandle {
   dir: string
   env: Record<string, string>

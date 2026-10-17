@@ -2,7 +2,9 @@
 
 A DSH (DeepSeek Harness) plugin for delegating real coding tasks to the logged-in Google Antigravity CLI. Based on [ZEM17/dsh-subagent-agy](https://github.com/ZEM17/dsh-subagent-agy), MIT licensed.
 
-**Version: 0.4.1.** The production-style one-shot task, follow-up and DSH Jobs workflows have been tested locally on DSH 0.2.0-rc.2. Native continuable child sessions are an **opt-in experimental feature**, tested with mocks, **not yet verified end-to-end in the DSH UI**.
+**Version: 0.4.2.** New: a unified AGY activity model (tool steps shown live as started/finished/failed, folded into one collapsible panel when the turn ends), **experimental persistent CLI sessions** (`nativePersistentSessions`, off by default), and a per-turn token-usage fix (on resumed conversations AGY's `result.usage` is cumulative; DSH now gets the sum of this turn's model calls). Design notes and verification: [#2](https://github.com/hhanmj/dsh-agy/issues/2) and `docs/decisions/0001-v0.5.0-phase0.zh.md`.
+
+The production-style one-shot task, follow-up and DSH Jobs workflows have been tested locally on DSH 0.2.0-rc.2. Native continuable child sessions are an **opt-in experimental feature**, tested with mocks, **not yet verified end-to-end in the DSH UI**.
 
 ## Features
 
@@ -96,6 +98,23 @@ With `sharedSkills` (skill names, prefixes ending in `*`, or `*` for every model
 
 AGY's own ways to add skills: `~/.gemini/config/skills/<name>/SKILL.md` (global), `.agents/skills/<name>/SKILL.md` in a project, `~/.gemini/config/skills.json` declaring external folders, or `agy plugin install`; list them with `agy -p "/skills" --output-format json` (no quota).
 
+## Collapsible execution panel (GenUI)
+
+While a main-chat turn runs, every AGY tool step's start, finish and failure streams live as `> AGY · … — running / done / failed` (from the unified activity model: ACTIVE/DONE/ERROR of one step fold into one record, parameters and output are redacted and truncated, unknown step types keep their raw identifier); when the turn ends they are replaced by **one collapsible "AGY execution" panel** (a `dsh-ui` accordion with a timeline: tool, subject, done/failed, duration, redacted output/error preview, up to the latest 80 steps) rendered by [dsh-genui](https://github.com/omdsh-dev/dsh-genui) (`nativeChatExecutionPanel`, default on; `nativeChatPanelLanguage`: zh/en). It lists only AGY's own recorded tool steps; without dsh-genui it shows as a JSON code block. Later prompts to AGY omit these panels. GenUI's `panel:true` dock publishes only after a message settles, so it cannot update live; the panel therefore lives in the message.
+
+**Why not a native chat card:** on DSH 0.2.0-rc.2 a third-party plugin that appends a new session event type makes the session impossible to reopen (`Session.append()` cannot mark it `ignorable`), and upstream plugin practices forbid it; a persistable plugin-record API only exists from DSH 0.2.1-rc.2. Without upgrading DSH, live progress lines plus the settled in-message panel are the equivalent UI (the panel title includes AGY's thinking-token count; the thinking itself is not available).
+
+## Experimental: persistent AGY CLI sessions (`nativePersistentSessions`, off by default)
+
+When enabled, every DSH session served by AGY (main chat or native child) keeps one `agy --input-format stream-json --output-format stream-json` process; each turn writes one `{"event":"user","message":{"content":"…"}}` line to stdin and completes on that turn's `result`, instead of starting the CLI per turn.
+
+- **Reuse and restart**: the process is reused while its start options (model, effort, cwd, extra directories, supervision, permissions) stay the same; any change closes it and a new process continues the same conversation with `--conversation`. Idle processes close after `nativePersistentIdleMs` (default 10 min); all are terminated when the plugin stops. Turns of one session run in order; sessions run concurrently and stay isolated.
+- **Cancel**: the protocol has no per-turn cancel, so DSH's stop button kills the process; the turn is reported cancelled (never successful) and the next turn resumes the last **completed** turn in a new process. Timeouts, unexpected exits and a missing `result` are reported as failures with the stderr tail.
+- **Usage**: `num_turns`, `usage` and `duration_seconds` are cumulative; per-turn usage comes from this turn's model calls.
+- **Fallback**: without `--input-format` in `agy help`, one process per turn is used; a message starting with `/` (which the CLI would treat as a slash command and end the session) runs one-shot for that turn; DSH title/compaction requests stay one-shot.
+- **Inspection**: `antigravity_tasks` lists live persistent processes (PID, state, turns, conversation); every trace turn records `process pid / turn / reused`.
+- **Verified (real AGY 1.4.0, throwaway directories)**: five turns on one process, live tool steps, a stopped turn followed by a new process resuming the conversation; warm persistent follow-ups median **2442 ms** vs one-shot resumed turns median **6884 ms** (3 runs each, `node scripts/live-persistent-e2e.mjs`). The cold first turn additionally pays `agy help`/`agy models` and process start-up (about 3–6 s). Not yet verified inside DSH Desktop.
+
 ## AGY thinking
 
 AGY 1.4.0 does not expose its thinking: stream-json reports only `thinking_tokens`, and the `PostInvocation` hook payload carries no thinking field (verified). Thinking is therefore neither shown nor faked; the main-chat progress lines and `antigravity_trace` show the real execution.
@@ -127,7 +146,7 @@ This is a guardrail against mistakes, **not a security boundary**: AGY with skip
 
 ```powershell
 npm run build
-node --test scripts/evidence.test.mjs scripts/plugin-smoke.test.mjs scripts/native-manager.test.mjs scripts/native-continuable.test.mjs scripts/stream-trace.test.mjs scripts/supervision.test.mjs scripts/models.test.mjs scripts/native-chat.test.mjs scripts/skills-bridge.test.mjs
+node --test scripts/evidence.test.mjs scripts/plugin-smoke.test.mjs scripts/native-manager.test.mjs scripts/native-continuable.test.mjs scripts/stream-trace.test.mjs scripts/supervision.test.mjs scripts/models.test.mjs scripts/native-chat.test.mjs scripts/skills-bridge.test.mjs scripts/activity.test.mjs scripts/persistent.test.mjs
 ```
 
 `npm test` additionally checks for a locally installed `agy` CLI and does not send prompts unless you explicitly run `npm run selftest:e2e` or `node scripts/live-trace-e2e.mjs` (spends AGY quota, temporary directories only).

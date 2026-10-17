@@ -337,6 +337,8 @@ export interface RunStartInfo {
   model_source?: string
   /** DSH skills exposed to AGY for this run. */
   shared_skills?: string[]
+  /** Persistent session: the agy process this turn ran on. */
+  process?: { pid?: number; turn: number; reused: boolean }
 }
 export interface RunEndInfo {
   outcome: string
@@ -702,12 +704,19 @@ function stamp(ms: number): string {
 }
 
 /** One compact line per record for model-facing rendering. */
+/** ' process pid=… turn=… (reused|new)' for persistent-session turns. */
+function processLabel(value: unknown): string {
+  if (typeof value !== 'object' || value === null) return ''
+  const p = value as { pid?: unknown; turn?: unknown; reused?: unknown }
+  return ` process pid=${String(p.pid ?? '?')} turn=${String(p.turn ?? '?')} ${p.reused === true ? 'reused' : 'new'}`
+}
+
 export function renderTraceRecord(record: TraceRecord): string {
   const head = `#${record.seq} ${stamp(record.ts)} ${record.type}`
   const step = typeof record.step === 'number' ? ` step ${record.step}` : ''
   switch (record.type) {
     case 'run_start':
-      return `${head} run=${String(record.run)} mode=${String(record.mode)} transport=${String(record.transport)}${record.resumed ? ' resumed' : ''} model=${record.model ? String(record.model) : '(CLI default)'}${record.effort ? ` effort=${String(record.effort)}` : ''}`
+      return `${head} run=${String(record.run)} mode=${String(record.mode)} transport=${String(record.transport)}${record.resumed ? ' resumed' : ''} model=${record.model ? String(record.model) : '(CLI default)'}${record.effort ? ` effort=${String(record.effort)}` : ''}${processLabel(record.process)}`
     case 'init':
       return `${head} conversation=${String(record.conversation_id)} permission_mode=${String(record.permission_mode)} tools=${String(record.tool_count)}`
     case 'tool_call':

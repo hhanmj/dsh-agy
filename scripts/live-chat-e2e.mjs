@@ -74,6 +74,8 @@ try {
   const a1 = await ask(q1)
   console.log('turn 1:', JSON.stringify(a1))
   ok(/LEFT=\s*red/i.test(a1) && /RIGHT=\s*blue/i.test(a1), 'AGY read the attached image through its own viewer')
+  const fence = a1.split('```dsh-ui\n')[1]
+  ok(fence !== undefined && JSON.parse(fence.slice(0, fence.indexOf('\n```'))).items[0].type === 'accordion' && !/> AGY ·/.test(a1), 'settled message carries one collapsible execution panel instead of progress lines')
   const a2 = await ask([...q1, { role: 'assistant', content: [{ type: 'text', text: a1 }] }, { role: 'user', content: [{ type: 'text', text: 'Reply with exactly the single word PONG2. Do not use any tools.' }] }])
   console.log('turn 2:', JSON.stringify(a2))
   ok(/PONG2/.test(a2), 'main session continued its AGY conversation')

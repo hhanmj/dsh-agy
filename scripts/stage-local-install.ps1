@@ -45,7 +45,7 @@ try {
   $package = Join-Path $unpacked 'package.json'
   if (-not (Test-Path $package)) { throw 'No package.json in archive' }
   $j = Get-Content $package -Raw | ConvertFrom-Json
-  if ($j.name -ne '@dsh-external/dsh-subagent-agy-reviewed' -or $j.version -ne '0.4.1') {
+  if ($j.name -ne '@dsh-external/dsh-subagent-agy-reviewed' -or $j.version -ne $metadata.version) {
     throw 'Unexpected package identity; refusing deployment'
   }
   if (-not (Test-Path (Join-Path $unpacked 'lib\index.js')) -or

@@ -25,7 +25,7 @@ export const subprocess = {
   },
   spawn(spec) {
     const child = nodeSpawn(spec.argv[0], spec.argv.slice(1), {
-      cwd: spec.cwd, env: { ...process.env, ...spec.env }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+      cwd: spec.cwd, env: { ...process.env, ...spec.env }, stdio: [spec.stdio.stdin === 'pipe' ? 'pipe' : 'ignore', 'pipe', 'pipe'], windowsHide: true,
     })
     const out = spec.stdio.stdout === 'pipe' ? undefined : collector()
     const err = collector()
@@ -44,7 +44,7 @@ export const subprocess = {
     }
     spec.signal?.addEventListener('abort', terminate, { once: true })
     return {
-      stdin: undefined, stderr: undefined, control: undefined,
+      stdin: spec.stdio.stdin === 'pipe' ? child.stdin : undefined, stderr: undefined, control: undefined, pid: child.pid,
       stdout: out ? undefined : child.stdout,
       collected: { stderr: err.reader, ...(out ? { stdout: out.reader } : {}) },
       done, terminate,

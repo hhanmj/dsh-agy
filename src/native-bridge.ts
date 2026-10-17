@@ -126,7 +126,9 @@ export function nativePrompt(options: GenerateOptions, resume: boolean, render: 
     }
     if (message.role === 'system' && !includeSystem) continue
     const body = renderBlocks(message.content, render, state)
-    if (body.trim().length > 0) items.push({ role: message.role, body })
+    // A main chat's own execution panels (GenUI fences) are display-only.
+    const visible = lenient && message.role === 'assistant' ? body.replace(/```dsh-ui[\s\S]*?```/g, '[AGY execution panel omitted]') : body
+    if (visible.trim().length > 0) items.push({ role: message.role, body: visible })
   }
   if (resume) {
     const lastUser = items.findLast((message) => message.role === 'user')
@@ -171,6 +173,13 @@ export type NativeCliRunner = (options: GenerateOptions, sink: NativeTextSink) =
 export interface NativeRunOutcome {
   text: string
   usage?: TokenUsage
+  /**
+   * Final assembled text when it should differ from what was streamed (a main
+   * chat replaces its live AGY progress lines with a collapsible execution
+   * panel). DSH keeps the block-end text as the message; nothing is invented —
+   * the panel lists AGY's own recorded tool steps.
+   */
+  display?: string
 }
 
 /**
@@ -270,6 +279,7 @@ export class NativeAgyLlmAdapter extends LlmAdapter {
     let settled = false
     let finalText = ''
     let usage: TokenUsage | undefined
+    let display: string | undefined
     let failure: { error: unknown } | undefined
     const notify = (): void => {
       const resume = wake
@@ -289,6 +299,7 @@ export class NativeAgyLlmAdapter extends LlmAdapter {
         (outcome) => {
           finalText = typeof outcome === 'string' ? outcome : typeof outcome?.text === 'string' ? outcome.text : ''
           usage = typeof outcome === 'object' && outcome !== null ? outcome.usage : undefined
+          display = typeof outcome === 'object' && outcome !== null && typeof outcome.display === 'string' ? outcome.display : undefined
           settled = true
           notify()
         },
@@ -320,7 +331,8 @@ export class NativeAgyLlmAdapter extends LlmAdapter {
       await running
       if (failure !== undefined) throw failure.error
       if (options.signal?.aborted) throw new Error('AGY native bridge: request aborted')
-      const remainder = reconcileFinalText(streamed, finalText)
+      // With a display override the runner already reconciled AGY's text itself.
+      const remainder = display !== undefined ? '' : reconcileFinalText(streamed, finalText)
       if (!opened) {
         opened = true
         yield { type: 'block-start', index: 0, blockType: 'text' }
@@ -329,7 +341,7 @@ export class NativeAgyLlmAdapter extends LlmAdapter {
         streamed += remainder
         yield { type: 'text-delta', index: 0, text: remainder }
       }
-      yield { type: 'block-end', index: 0, block: { type: 'text', text: streamed } }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: display ?? streamed } }
       // Real AGY-reported counts only; nothing is estimated.
       if (usage !== undefined) yield { type: 'usage', usage }
       yield { type: 'finish', reason: { kind: 'stop' } }
