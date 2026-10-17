@@ -1998,3 +1998,266 @@ export function apply(ctx: Context, config: Config): void {
                 kind: { type: 'string', required: true, const: 'foreground' },
                 runId: { type: 'string', required: true },
                 task: { type: 'string', required: true },
+                output: { type: 'array', required: true, items: { type: 'json' } },
+                evidence: { type: 'json', required: true }
+              },
+            },
+            render: (_args: unknown, value: { output: unknown[]; evidence: JsonValue }) => [{ type: 'text', text: outputValueText(value.output) + reviewSummary(value.evidence) }],
+          },
+          isConcurrencySafe: () => true,
+          async execute(args: { description: string; task: string; prompt: string; model?: string; effort?: string }, exec: ToolRunContext) {
+            const parent = exec.agent
+            if (!parent) throw new Error(`${PREFIX}: antigravity_followup tool requires a calling agent (exec.agent was undefined)`)
+            const provider = ctx.subagents.getProvider(config.providerName) as AntigravitySubagentProvider | undefined
+            if (!(provider instanceof AntigravitySubagentProvider)) {
+              throw new Error(`${PREFIX}: provider "${config.providerName}" is not the antigravity provider`)
+            }
+            const records = loadTaskRegistry(config)
+            const record = records[args.task]
+            if (record === undefined) {
+              throw new Error(
+                `${PREFIX}: no such task "${args.task}" — run the antigravity tool first (task keys survive DSH restarts via ~/.dsh/agy-conversations.json)`,
+              )
+            }
+            const before = captureWorkspace(record.cwd)
+            const run = await ctx.subagents.start(config.providerName, {
+              label: args.description,
+              prompt: [{ type: 'text' as const, text: args.prompt }],
+              parent,
+              signal: exec.signal,
+              agyOptions: { conversationId: record.conversationId, cwd: record.cwd, model: args.model, effort: args.effort },
+            } as AgyNativeRequest)
+            const settled = await settleWithEvidence(run, before, args.task, provider, config)
+            const refreshed = provider.recordOf(settled.runId)
+            await updateTaskRegistry(config, (records) => {
+              records[args.task] = { ...record, createdAt: Date.now(), ...(refreshed !== undefined ? { conversationId: refreshed.conversationId } : {}) }
+            }, ctx.logger)
+            return { ...settled, task: args.task, evidence: JSON.parse(JSON.stringify(settled.evidence)) as JsonValue }
+          },
+        }),
+      ),
+    `${PREFIX}: tool ${config.followupToolName}`,
+  )
+
+
+  // Machine-readable evidence from the LOCAL working tree, never from AGY's self-report.
+  ctx.effect(
+    () => ctx.tools.register(
+      defineTool({
+        name: config.evidenceToolName,
+        description: 'Read independently collected file-change evidence for a finished AGY task. review_status is always pending; verify functions and run tests yourself before accepting.',
+        parameters: {
+          task: { type: 'string', required: true, description: 'AGY task key returned by antigravity or antigravity_followup.' },
+        },
+        output: {
+          schema: {
+            type: 'object', additionalProperties: false,
+            properties: { evidence: { type: 'json', required: true } },
+          },
+          render: (_args: unknown, result: { evidence: JsonValue }) =>
+            [{ type: 'text', text: JSON.stringify(result.evidence, null, 2) }],
+        },
+        isConcurrencySafe: () => true,
+        async execute(args: { task: string }) {
+          const evidence = readEvidence(args.task, config.evidenceDir)
+          if (!evidence) throw new Error(`${PREFIX}: no evidence for task "${args.task}" (job may still be running, or was started before evidence collection was enabled)`)
+          return { evidence: JSON.parse(JSON.stringify(evidence)) as JsonValue }
+        },
+      }),
+    ),
+    `${PREFIX}: tool ${config.evidenceToolName}`,
+  )
+
+  // Login-window tool: pop agy's interactive login on demand (also happens
+  // automatically on auth failures when `autoLoginWindow` is on).
+  ctx.effect(
+    () =>
+      ctx.tools.register(
+        defineTool({
+          name: config.loginToolName,
+          description:
+            'Open the interactive Antigravity (agy) login window so the user can authenticate on the spot (Google sign-in; Windows opens a new console running agy). Call this when an antigravity run failed with "authentication required" and no window opened automatically.',
+          parameters: {},
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                message: { type: 'string', required: true },
+              },
+            },
+            render: (_args: unknown, value: { message: string }) => [{ type: 'text', text: value.message }],
+          },
+          isConcurrencySafe: () => true,
+          async execute() {
+            const provider = ctx.subagents.getProvider(config.providerName) as AntigravitySubagentProvider | undefined
+            if (!(provider instanceof AntigravitySubagentProvider)) {
+              throw new Error(`${PREFIX}: provider "${config.providerName}" is not the antigravity provider`)
+            }
+            return { message: await provider.launchLogin() }
+          },
+        }),
+      ),
+    `${PREFIX}: tool ${config.loginToolName}`,
+  )
+
+  // Tasks tool: list in-flight runs plus durable registry history. This is
+  // the only restart-safe way to recover a `task` key for the follow-up tool.
+  ctx.effect(
+    () =>
+      ctx.tools.register(
+        defineTool({
+          name: config.tasksToolName,
+          description:
+            'List Antigravity (agy) tasks: currently running tasks (foreground and background) plus recently finished tasks from the durable registry (~/.dsh/agy-conversations.json, or registryPath). Task keys survive DSH restarts — use a `task` key with ' +
+            config.followupToolName +
+            ' to resume that conversation, or pass one to ' +
+            config.cancelToolName +
+            ' to stop a running task.',
+          parameters: {
+            limit: {
+              type: 'number',
+              description: 'How many recently finished tasks to include, newest first (default 20, max 50).',
+            },
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                running: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      task: { type: 'string', required: true },
+                      label: { type: 'string', required: true },
+                      cwd: { type: 'string', required: true },
+                      background: { type: 'boolean', required: true },
+                      startedAt: { type: 'number', required: true },
+                    },
+                  },
+                },
+                recent: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      task: { type: 'string', required: true },
+                      label: { type: 'string', required: true },
+                      cwd: { type: 'string', required: true },
+                      createdAt: { type: 'number', required: true },
+                    },
+                  },
+                },
+              },
+            },
+            render: (_args: unknown, value: { running?: unknown[]; recent?: unknown[] }) => {
+              const lines: string[] = []
+              const running = value.running ?? []
+              const recent = value.recent ?? []
+              if (running.length === 0) {
+                lines.push('No running tasks.')
+              } else {
+                lines.push(`Running (${running.length}):`)
+                for (const entry of running) {
+                  const item = entry as { task?: unknown; label?: unknown; background?: unknown; startedAt?: unknown }
+                  lines.push(
+                    `  task: ${String(item.task ?? '?')}  label: ${String(item.label ?? '')}  mode: ${item.background === true ? 'background' : 'foreground'}  started: ${formatStamp(typeof item.startedAt === 'number' ? item.startedAt : 0)}`,
+                  )
+                }
+              }
+              if (recent.length === 0) {
+                lines.push('No recent finished tasks in the registry.')
+              } else {
+                lines.push(`Recent finished (${recent.length}):`)
+                for (const entry of recent) {
+                  const item = entry as { task?: unknown; label?: unknown; createdAt?: unknown }
+                  lines.push(
+                    `  task: ${String(item.task ?? '?')}  label: ${String(item.label ?? '')}  created: ${formatStamp(typeof item.createdAt === 'number' ? item.createdAt : 0)}`,
+                  )
+                }
+              }
+              return [{ type: 'text', text: lines.join('\n') }]
+            },
+          },
+          isConcurrencySafe: () => true,
+          async execute(args: { limit?: number }) {
+            const current = ctx.subagents.getProvider(config.providerName) as AntigravitySubagentProvider | undefined
+            if (!(current instanceof AntigravitySubagentProvider)) {
+              throw new Error(`${PREFIX}: provider "${config.providerName}" is not the antigravity provider`)
+            }
+            const running = current.listActive()
+            const records = loadTaskRegistry(config, ctx.logger)
+            const limit = Math.max(0, Math.min(50, Math.floor(args.limit ?? 20)))
+            const recent = Object.entries(records)
+              .sort((a, b) => b[1].createdAt - a[1].createdAt)
+              .slice(0, limit)
+              .map(([task, record]) => ({ task, label: record.label, cwd: record.cwd, createdAt: record.createdAt }))
+            return { running, recent }
+          },
+        }),
+      ),
+    `${PREFIX}: tool ${config.tasksToolName}`,
+  )
+
+  // Cancel tool: stop a running task by its task key; the agy process tree
+  // is terminated and the run settles as cancelled (its conversation record,
+  // if any, stays in the registry for later follow-up).
+  ctx.effect(
+    () =>
+      ctx.tools.register(
+        defineTool({
+          name: config.cancelToolName,
+          description:
+            'Stop a running Antigravity (agy) task by its task key. Get running task keys from ' +
+            config.tasksToolName +
+            ' (or the `task` field of an in-flight antigravity call). The agy process tree is terminated and the run settles as cancelled; its conversation record (if any) is kept for follow-up.',
+          parameters: {
+            task: {
+              type: 'string',
+              required: true,
+              description: 'The task key of a RUNNING task (see ' + config.tasksToolName + ').',
+            },
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                cancelled: { type: 'boolean', required: true },
+                task: { type: 'string', required: true },
+                message: { type: 'string', required: true },
+              },
+            },
+            render: (_args: unknown, value: { message: string }) => [{ type: 'text', text: value.message }],
+          },
+          isConcurrencySafe: () => true,
+          async execute(args: { task: string }) {
+            const current = ctx.subagents.getProvider(config.providerName) as AntigravitySubagentProvider | undefined
+            if (!(current instanceof AntigravitySubagentProvider)) {
+              throw new Error(`${PREFIX}: provider "${config.providerName}" is not the antigravity provider`)
+            }
+            const cancelled = current.cancelActive(args.task)
+            if (!cancelled) {
+              throw new Error(
+                `${PREFIX}: no running task "${args.task}" — running tasks are listed by ${config.tasksToolName}; finished tasks cannot be cancelled (their conversations resume via ${config.followupToolName})`,
+              )
+            }
+            return {
+              cancelled: true,
+              task: args.task,
+              message: `Cancellation requested for task ${args.task} — its run settles as cancelled.`,
+            }
+          },
+        }),
+      ),
+    `${PREFIX}: tool ${config.cancelToolName}`,
+  )
+
+  ctx.logger.info(
+    `${PREFIX}: provider "${config.providerName}" + tools "${config.toolName}" / "${config.followupToolName}" / "${config.tasksToolName}" / "${config.cancelToolName}" ready (command: ${config.command}${config.model ? `, model: ${config.model}` : ''})`,
+  )
+}
