@@ -1,0 +1,4 @@
+# Reviewed AGY subagent bundle entry. Install the locally built tgz.
+- insert:
+    - id: dsh-subagent-agy-reviewed
+      name: '@dsh-external/dsh-subagent-agy-reviewed'
