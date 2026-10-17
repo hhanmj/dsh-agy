@@ -16,17 +16,17 @@ A DSH (DeepSeek Harness) plugin for delegating real coding tasks to the logged-i
 Requires DSH 0.2.0-rc.2-compatible runtime, Node.js and the `agy` binary installed and logged in.
 
 ```powershell
-npm install
+npm ci
 npm test
-npm pack
-dsh plugin --profile web add ".\dsh-external-dsh-subagent-agy-reviewed-0.4.1.tgz"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stage-local-install.ps1
+dsh plugin --profile web add ".\deploy\dsh-subagent-agy-reviewed"
 ```
 
-Use the profile **actually started** by your DSH host, not necessarily `web`. Replacing an installed bundle version requires a host-process restart. Avoid concurrent plugin-manager writes.
+**For DSH Desktop/Tauri install from the persistent directory, not a local `.tgz` file.** We observed its startup recovery report `INTERNAL_PLUGIN_DANGLING_LINK_UNINSTALLING` and remove a plugin registered via `file:...tgz`, along with its Profile config. The staged directory contains only packaged source output, is gitignored, and remains in place for the next start. Install using the profile actually started by your host, and restart the backend. This directory workaround still needs a restart test on the target Desktop. Avoid concurrent plugin-manager writes.
 
 ## Experimental native child sessions
 
-The 0.4.1 bundle configuration includes `nativeContinuableEnabled: true`. If your already-installed bundle lacks that setting, enable it without reinstalling:
+The staged v0.4.1 bundle configuration includes `nativeContinuableEnabled: true`; **no separate toggle is necessary for the directory installation**. For an already installed and intact plugin whose configuration lacks that setting, enable it with:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "F:\\agy-subagebt\\scripts\\set-native-preview.ps1" -Enable

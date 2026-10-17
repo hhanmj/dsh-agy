@@ -2,20 +2,20 @@
 
 基于 [ZEM17/dsh-subagent-agy](https://github.com/ZEM17/dsh-subagent-agy) 开发，MIT 许可。通过已登录的 Antigravity CLI 委派实际 UI/UX 和代码任务，主模型负责独立验收。
 
-**当前版本：v0.4.1。** 已实测通过的 v0.4.0 前台任务、后台 Jobs、Better Sidebar 后台显示和会话恢复保持不变；新增 DSH 原生 Continuable 子会话桥接为**实验功能**，尚未完成真实 DSH 界面的端到端验证。v0.4.1 的发布包已显式开启预览模式；此前安装的同版本发布包可直接使用下述开关脚本，无需重新下载。
+**当前版本：v0.4.1。** 已实测通过的 v0.4.0 前台任务、后台 Jobs、Better Sidebar 后台显示和会话恢复保持不变；新增 DSH 原生 Continuable 子会话桥接为**实验功能**，尚未完成真实 DSH 界面的端到端验证。v0.4.1 的发布包已显式开启预览模式。注意：DSH Desktop 某些版本启动时会错误地将通过本地 `.tgz` 安装的插件判为悬空链接并自动卸载；建议使用下述持久目录安装方式。
 
 ## 安装
 
 先安装并登录 `agy` CLI，在源代码目录运行：
 
 ```powershell
-npm install
+npm ci
 npm test
-npm pack
-dsh plugin --profile web add ".\dsh-external-dsh-subagent-agy-reviewed-0.4.1.tgz"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stage-local-install.ps1
+dsh plugin --profile web add ".\deploy\dsh-subagent-agy-reviewed"
 ```
 
-这里 `web` 只是示例，使用你实际启动的 DSH Profile。更新安装包需要重启对应后端。避免同时进行插件市场的批量更新。
+这里 `web` 只是示例，使用你实际启动的 DSH Profile。务必安装真实目录 `deploy/dsh-subagent-agy-reviewed`，**不要使用 `.tgz` 路径**：Tauri 日志已观察到 `INTERNAL_PLUGIN_DANGLING_LINK_UNINSTALLING` 和 `Recovery uninstall removed plugin`。目录部署文件仅在本地生成并被 `.gitignore` 排除。安装完成后重启后端，并首先检查插件有没有再次被卸载；如被卸载，检查桌面端日志再决定下一步，不要循环重装。避免同时进行插件市场批量更新。
 
 ## 功能
 
@@ -29,7 +29,7 @@ dsh plugin --profile web add ".\dsh-external-dsh-subagent-agy-reviewed-0.4.1.tgz
 
 ### v0.4.1 原生子代理实验模式
 
-**设置入口：** 本项目提供 PowerShell 开关脚本；这不是插件市场里的 GUI 开关。对当前已安装的 v0.4.1，直接运行（自动备份 Profile 配置，支持恢复）：
+**设置入口：** 使用上面的持久目录部署包时，`cordis.patch.yml` 已经显式开启实验功能，**无需再运行开关脚本**。下列脚本仅供需要手动切换的用户使用，会备份当前 Profile；这不是插件市场里的 GUI 开关。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "F:\\agy-subagebt\\scripts\\set-native-preview.ps1" -Enable

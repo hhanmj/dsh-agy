@@ -3,6 +3,7 @@ node_modules/
 lib/
 *.tsbuildinfo
 *.tgz
+deploy/
 coverage/
 .nyc_output/
 *.log
