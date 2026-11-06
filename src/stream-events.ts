@@ -3,6 +3,12 @@
  * stream-json` protocol (verified against agy 1.4.0, see
  * scripts/fixtures/agy-1.4.0-*.ndjson).
  *
+ * agy 1.4.7: `--output-format stream-json` and `--input-format stream-json`
+ * are still documented (scripts/fixtures/agy-1.4.7-help.txt) and the 1.4.1–1.4.7
+ * changelog lists no change to the headless output. The event shapes below were
+ * NOT re-captured on 1.4.7 (that needs a model turn); they remain 1.4.0 captures
+ * (provenance in scripts/fixtures/manifest.json), and anything new stays opaque.
+ *
  * Observed vocabulary on 1.4.0 (only these shapes are interpreted):
  * - `init`: `conversation_id`, `init.cwd`, `init.tools[]`, `init.permission_mode`.
  * - `step_update`: `conversation_id`, `step_index`, `state` (ACTIVE | DONE |

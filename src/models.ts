@@ -1,9 +1,14 @@
 /**
  * Antigravity CLI model catalog for per-child model/effort selection.
  *
- * Verified on agy 1.4.0:
+ * Verified on agy 1.4.0, listing format re-verified on 1.4.7 (real captures in
+ * scripts/fixtures/agy-1.4.7-models*.txt, see scripts/fixtures/manifest.json):
  * - "agy models" prints one "<id>\t<display name>" line per model; progress
- *   goes to stderr. "agy models --output-format json" is rejected on 1.4.0.
+ *   ("Fetching available models...") goes to stderr. "agy models
+ *   --output-format json" is still rejected on 1.4.7 (exit 1, "flags provided
+ *   but not defined"); the subcommand has no flags besides -h/--help.
+ * - The catalog is account/server dependent, not tied to the CLI version: on
+ *   1.4.7 every listed model happened to have effort variants.
  * - Effort variants share a base: gemini-3.8-flash-{low,medium,high} with
  *   display names "... (Low|Medium|High)". "--model <base> --effort <e>" runs
  *   the variant <base>-<e>; a variant id plus a different --effort is an error.

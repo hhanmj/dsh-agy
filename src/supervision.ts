@@ -134,6 +134,8 @@ export function prepareSupervisor(options: {
   roots: readonly string[]
   /** Readable even inside protected locations (shared DSH skill folders); never writable. */
   readRoots?: readonly string[]
+  /** Additional host-owned paths to protect (for example the ZCode data directory). */
+  extraProtectedPaths?: readonly string[]
   cwd: string
   home: string
   settings: SupervisionSettings
@@ -155,7 +157,7 @@ export function prepareSupervisor(options: {
     runId,
     roots: options.roots.map((root) => resolve(root)),
     readRoots: (options.readRoots ?? []).map((root) => resolve(root)),
-    protectedPaths: defaultProtectedPaths(options.home),
+    protectedPaths: [...defaultProtectedPaths(options.home), ...(options.extraProtectedPaths ?? []).map((path) => resolve(path))],
     supervisorDir: dir,
     home: options.home,
     builtinRules: settings.builtinRules,

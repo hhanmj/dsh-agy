@@ -364,3 +364,47 @@ test('concurrent runs keep separate traces with strictly increasing seq', async 
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('fixture provenance: every fixture is listed in manifest.json with its agy version, origin and quota cost', () => {
+  const manifest = JSON.parse(fixture('manifest.json'))
+  const files = readdirSync(FIXTURES).filter((n) => n.startsWith('agy-')).sort()
+  assert.deepEqual(Object.keys(manifest.fixtures).sort(), files, 'manifest and folder agree')
+  for (const [name, entry] of Object.entries(manifest.fixtures)) {
+    assert.ok(name.startsWith(`agy-${entry.agyVersion}-`), `${name}: version prefix matches agyVersion`)
+    assert.ok(['real-capture', 'synthetic'].includes(entry.origin), `${name}: origin`)
+    assert.equal(typeof entry.quota, 'boolean', `${name}: quota`)
+    assert.equal(entry.quota, name.endsWith('.ndjson'), `${name}: only stream-json captures needed a model turn`)
+  }
+})
+
+test('real agy 1.4.7 help still documents every flag the plugin emits; the probe keeps stream-json in and out', async () => {
+  const help = fixture('agy-1.4.7-help.txt')
+  for (const flag of ['--output-format', '--input-format', '--conversation', '--add-dir', '--sandbox', '--print', '--print-timeout', '--model', '--effort', '--dangerously-skip-permissions', '--agent']) {
+    assert.match(help, new RegExp(`^\\s+${flag}\\s`, 'm'), flag)
+  }
+  assert.match(help, /^\s+-p\s+Short alias for --print$/m)
+  assert.match(help, /--output-format\s+Output format for print mode \(text, json, stream-json\)/)
+  assert.doesNotMatch(help, /--prompt-file/, 'still absent, so the plugin keeps passing prompts via -p / stdin')
+  const dir = mkdtempSync(join(tmpdir(), 'agy-147-help-'))
+  try {
+    const PONG = fixture('agy-1.4.0-pong.ndjson')
+    const h = harness(dir, [{ chunks: [Buffer.from(PONG)] }, { chunks: [Buffer.from(PONG)] }], { nativeContinuableEnabled: true, nativePersistentSessions: false, nativeChatExecutionPanel: false }, { help })
+    const run = await h.provider.startWithDirs(
+      { label: 'help probe', parent: parentAgent(dir), prompt: [{ type: 'text', text: 'go' }], signal: new AbortController().signal },
+      [], { cwd: dir, stream: { onText: () => {} } },
+    )
+    assert.equal((await run.result).stopReason, 'completed')
+    await run.dispose()
+    const first = h.spawns[0].spec.argv
+    assert.equal(first[first.indexOf('--output-format') + 1], 'stream-json')
+    // A prompt too long for the command line goes over stdin only when --input-format is detected.
+    const main = 'help-147-main'
+    h.agents.set(main, { id: main, session: { id: main, header: { cwd: dir } } })
+    for await (const _ of h.adapter.stream({ provider: 'agy-native-cli', model: 'gemini-3.8-flash', sessionId: main, messages: [{ role: 'user', content: [{ type: 'text', text: 'z'.repeat(40_000) }] }] })) { /* drain */ }
+    const second = h.spawns[1].spec.argv
+    assert.equal(second[second.indexOf('--input-format') + 1], 'stream-json')
+    assert.equal(second.includes('-p'), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

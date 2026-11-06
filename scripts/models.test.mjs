@@ -213,3 +213,43 @@ test('antigravity_models reports the real listing without inventing entries', as
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// Real "agy models" stdout captured from agy 1.4.7 (quota-free; provenance in scripts/fixtures/manifest.json).
+const MODELS_147 = readFileSync(join(ROOT, 'scripts', 'fixtures', 'agy-1.4.7-models.txt'), 'utf8')
+const MODELS_147_JSON_REJECTED = readFileSync(join(ROOT, 'scripts', 'fixtures', 'agy-1.4.7-models-json-rejected.txt'), 'utf8')
+
+test('real agy 1.4.7 "agy models" listing: same "<id> TAB <name>" format, grouped into base models (LF and CRLF)', () => {
+  const expected = [
+    ['gemini-4-argon', 'Gemini 4 Argon', ['low', 'medium', 'high']],
+    ['gemini-3.8-flash', 'Gemini 3.8 Flash', ['low', 'medium', 'high']],
+    ['claude-opus-5-5', 'Claude Opus 5.5', ['low', 'medium', 'high']],
+    ['claude-sonnet-5-5', 'Claude Sonnet 5.5', ['low', 'medium', 'high']],
+    ['gpt-oss-120b', 'GPT-OSS 120B', ['medium']],
+  ]
+  for (const text of [MODELS_147, MODELS_147.replace(/\r?\n/g, '\r\n')]) {
+    const listed = parseAgyModelsOutput(text)
+    assert.equal(listed.length, 13, 'every listed line parses')
+    const models = groupBaseModels(listed)
+    assert.deepEqual(models.map((m) => [m.id, m.name, m.efforts]), expected)
+    assert.deepEqual(models[0].variants, ['gemini-4-argon-medium', 'gemini-4-argon-high', 'gemini-4-argon-low'], 'raw ids kept in listing order')
+    assert.equal(models.reduce((n, m) => n + m.variants.length, 0), 13)
+  }
+})
+
+test('selection rules hold on the real 1.4.7 catalog (base default high, variant ids, bounded efforts)', async () => {
+  const models = groupBaseModels(parseAgyModelsOutput(MODELS_147))
+  const args = (model, effort) => resolveSelection(models, model, effort).args
+  assert.deepEqual(args('claude-opus-5-5'), { model: 'claude-opus-5-5', effort: 'high' })
+  assert.deepEqual(args('claude-sonnet-5-5-low'), { model: 'claude-sonnet-5-5', effort: 'low' })
+  assert.deepEqual(args('gemini-4-argon', 'Medium'), { model: 'gemini-4-argon', effort: 'medium' })
+  assert.deepEqual(args('gpt-oss-120b'), { model: 'gpt-oss-120b', effort: 'medium' }, 'only variant is the default')
+  assert.throws(() => args('gemini-4-argon', 'xhigh'), /supports efforts low \| medium \| high, not xhigh/)
+  assert.throws(() => args('claude-sonnet-4-6'), /unknown AGY model/, 'the 1.4.0-era id is not in this catalog and is not invented')
+  const catalog = new AgyModelCatalog(async () => MODELS_147)
+  assert.deepEqual((await catalog.list()).map((m) => m.id), models.map((m) => m.id))
+})
+
+test('real agy 1.4.7 still rejects "agy models --output-format json", so the text listing is what we parse', () => {
+  assert.match(MODELS_147_JSON_REJECTED, /flags provided but not defined: -output-format/)
+  assert.deepEqual(parseAgyModelsOutput(MODELS_147_JSON_REJECTED), [], 'usage/error text never parses as models')
+})
