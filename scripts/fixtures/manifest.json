@@ -78,6 +78,36 @@
       "quota": false,
       "captured": "2026-10-26",
       "sanitized": "none needed (no account, path or conversation data)"
+    },
+    "agy-1.5.5-help.txt": {
+      "agyVersion": "1.5.5",
+      "origin": "real-capture",
+      "command": "agy help",
+      "stream": "stderr",
+      "exitCode": 0,
+      "quota": false,
+      "captured": "2026-11-11",
+      "sanitized": "none needed (no account, path or conversation data)"
+    },
+    "agy-1.5.5-models.txt": {
+      "agyVersion": "1.5.5",
+      "origin": "real-capture",
+      "command": "agy models",
+      "stream": "stdout",
+      "exitCode": 0,
+      "quota": false,
+      "captured": "2026-11-11",
+      "sanitized": "none needed (no account, path or conversation data)"
+    },
+    "agy-1.5.5-models-json-rejected.txt": {
+      "agyVersion": "1.5.5",
+      "origin": "real-capture",
+      "command": "agy models --output-format json",
+      "stream": "stderr",
+      "exitCode": 1,
+      "quota": false,
+      "captured": "2026-11-11",
+      "sanitized": "none needed (no account, path or conversation data)"
     }
   }
 }

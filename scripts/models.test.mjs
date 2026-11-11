@@ -253,3 +253,46 @@ test('real agy 1.4.7 still rejects "agy models --output-format json", so the tex
   assert.match(MODELS_147_JSON_REJECTED, /flags provided but not defined: -output-format/)
   assert.deepEqual(parseAgyModelsOutput(MODELS_147_JSON_REJECTED), [], 'usage/error text never parses as models')
 })
+
+// Real "agy models" stdout captured from agy 1.5.5 (quota-free; provenance in scripts/fixtures/manifest.json).
+const MODELS_155 = readFileSync(join(ROOT, 'scripts', 'fixtures', 'agy-1.5.5-models.txt'), 'utf8')
+const MODELS_155_JSON_REJECTED = readFileSync(join(ROOT, 'scripts', 'fixtures', 'agy-1.5.5-models-json-rejected.txt'), 'utf8')
+const HELP_155 = readFileSync(join(ROOT, 'scripts', 'fixtures', 'agy-1.5.5-help.txt'), 'utf8')
+
+test('real agy 1.5.5 listing: same format, gemini-4-carbon added ahead of argon, all variants grouped (LF and CRLF)', () => {
+  const expected = [
+    ['gemini-4-carbon', 'Gemini 4 Carbon', ['low', 'medium', 'high']],
+    ['gemini-4-argon', 'Gemini 4 Argon', ['low', 'medium', 'high']],
+    ['gemini-3.8-flash', 'Gemini 3.8 Flash', ['low', 'medium', 'high']],
+    ['claude-opus-5-5', 'Claude Opus 5.5', ['low', 'medium', 'high']],
+    ['claude-sonnet-5-5', 'Claude Sonnet 5.5', ['low', 'medium', 'high']],
+    ['gpt-oss-120b', 'GPT-OSS 120B', ['medium']],
+  ]
+  for (const text of [MODELS_155, MODELS_155.replace(/\r?\n/g, '\r\n')]) {
+    const listed = parseAgyModelsOutput(text)
+    assert.equal(listed.length, 16, 'every listed line parses (Fetching line never parses as a model)')
+    const models = groupBaseModels(listed)
+    assert.deepEqual(models.map((m) => [m.id, m.name, m.efforts]), expected)
+    assert.deepEqual(models[0].variants, ['gemini-4-carbon-medium', 'gemini-4-carbon-high', 'gemini-4-carbon-low'], 'raw ids kept in listing order')
+    assert.equal(models.reduce((n, m) => n + m.variants.length, 0), 16)
+  }
+})
+
+test('selection rules hold on the real 1.5.5 catalog (new carbon base resolves like the others)', () => {
+  const models = groupBaseModels(parseAgyModelsOutput(MODELS_155))
+  const args = (model, effort) => resolveSelection(models, model, effort).args
+  assert.deepEqual(args('gemini-4-carbon'), { model: 'gemini-4-carbon', effort: 'high' })
+  assert.deepEqual(args('gemini-4-carbon-low'), { model: 'gemini-4-carbon', effort: 'low' })
+  assert.deepEqual(args('gemini-4-carbon', 'Medium'), { model: 'gemini-4-carbon', effort: 'medium' })
+  assert.throws(() => args('gemini-4-carbon', 'xhigh'), /supports efforts low \| medium \| high, not xhigh/)
+})
+
+test('real agy 1.5.5 still rejects "agy models --output-format json"; help keeps every flag the plugin emits', () => {
+  assert.match(MODELS_155_JSON_REJECTED, /flags provided but not defined: -output-format/)
+  assert.deepEqual(parseAgyModelsOutput(MODELS_155_JSON_REJECTED), [])
+  for (const flag of ['--output-format', '--input-format', '--conversation', '--add-dir', '--sandbox', '--print', '--print-timeout', '--model', '--effort', '--dangerously-skip-permissions', '--agent']) {
+    assert.match(HELP_155, new RegExp(`^\\s+${flag}\\s`, 'm'), flag)
+  }
+  assert.match(HELP_155, /^\s+-p\s+Short alias for --print$/m)
+  assert.doesNotMatch(HELP_155, /--prompt-file/, 'still absent, so prompts keep going via -p / stdin')
+})
